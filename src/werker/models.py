@@ -18,6 +18,28 @@ class ScheduleKind(models.TextChoices):
     INTERVAL = "INTERVAL", "Fixed interval"
 
 
+class DeliveryGuarantee(models.TextChoices):
+    """AT_LEAST_ONCE (default): the reaper (werker.worker.reaper) reclaims a
+    stale RUNNING row and retries it — task functions must be idempotent,
+    since a crash after the task body finished but before the result was
+    written can cause a genuine second execution.
+
+    AT_MOST_ONCE (opt-in via @werker.at_most_once): the reaper does NOT
+    reclaim a stale RUNNING row under this guarantee — it marks it FAILED
+    directly instead. This guarantees the task body never runs twice, at
+    the cost of the task possibly never completing if the "stale" claim
+    was actually a false positive (worker alive but slow/paused).
+
+    Neither mode is true exactly-once (guaranteed-runs-once-AND-never-lost)
+    — that isn't achievable without the task's own side effects cooperating
+    via an idempotency key, which is a pattern task authors can layer on
+    top of either mode, not something a backend can provide unilaterally.
+    """
+
+    AT_LEAST_ONCE = "AT_LEAST_ONCE", "At least once"
+    AT_MOST_ONCE = "AT_MOST_ONCE", "At most once"
+
+
 class DBTaskResult(models.Model):
     """Backs both the Broker (claim-relevant columns) and the ResultStore
     (outcome-relevant columns) in werker's v1 Postgres implementation. See
@@ -45,6 +67,11 @@ class DBTaskResult(models.Model):
 
     attempts = models.PositiveIntegerField(default=0)
     max_retries = models.PositiveIntegerField(default=0)
+    delivery_guarantee = models.CharField(
+        max_length=20,
+        choices=DeliveryGuarantee.choices,
+        default=DeliveryGuarantee.AT_LEAST_ONCE,
+    )
 
     errors = models.JSONField(default=list, blank=True)
     return_value = models.JSONField(null=True, blank=True)

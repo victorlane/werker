@@ -2,15 +2,16 @@
 concurrent claimers racing the same due rows never claim the same row
 twice, and together claim every due row exactly once.
 
-Deliberately bypasses the async entrypoints (Broker.claim/.aclaim) and
-calls PostgresBroker._claim_sync directly from real OS threads via
-ThreadPoolExecutor. asgiref's thread_sensitive=True wrapping is meant to
-pin a *single* worker process's own sequential DB calls onto one thread
-(intentional — see werker.backend's module docstring); it is not the
-mechanism that provides cross-worker safety, so routing this test through
-it would not exercise genuine concurrent Postgres transactions. Real
-concurrency happens across separate worker processes/threads each holding
-their own connection — which is exactly what this test sets up directly.
+Calls PostgresBroker.claim (the canonical sync method — see werker.broker's
+module docstring on why sync is canonical and async is derived) directly
+from real OS threads via ThreadPoolExecutor, deliberately bypassing the
+async entrypoint (Broker.aclaim). aclaim's asgiref sync_to_async(
+thread_sensitive=True) wrapping is meant to pin a *single* worker
+process's own sequential DB calls onto one thread; it is not the mechanism
+that provides cross-worker safety, so routing this test through it would
+not exercise genuine concurrent Postgres transactions. Real concurrency
+happens across separate worker processes/threads each holding their own
+connection — which is exactly what this test sets up directly.
 """
 
 import threading
@@ -54,7 +55,7 @@ def test_concurrent_claim_never_double_claims_and_claims_everything():
         start_barrier.wait()
         try:
             while True:
-                claimed = broker._claim_sync(
+                claimed = broker.claim(
                     queue_names=["default"], limit=1, worker_id=worker_id
                 )
                 if not claimed:
