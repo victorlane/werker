@@ -3,10 +3,19 @@
 Composes a Broker + ResultStore (+, from phase 7, a ScheduleStore), all
 resolved from TASKS["<alias>"]["OPTIONS"]. `enqueue`/`get_result` are the
 canonical sync methods, matching django.tasks.backends.base.BaseTaskBackend
-itself (its own `enqueue` is the abstract sync method; `aenqueue` is a
-sync_to_async(thread_sensitive=True) wrapper Django provides for free) —
-so this backend only needs to override the sync methods; the inherited
-async wrappers are already correct and are not re-implemented here.
+itself.
+
+`aenqueue`/`aget_result` are explicitly overridden here too, NOT left as
+Django's inherited default `sync_to_async(self.enqueue, thread_sensitive=True)`
+wrapper — that default would route the whole call through asgiref's single
+process-wide 1-worker executor (see werker.broker's module docstring for
+why that's a real bottleneck, not just a theoretical one: it's the same
+executor every other thread_sensitive=True call in the process shares,
+including this worker's own heartbeat sends). Overriding them here to call
+straight through to Broker/ResultStore's own `a`-prefixed methods (which
+use their own dedicated executors) keeps the *entire* async path — from
+`task.aenqueue()` down to the DB — off that shared bottleneck, not just the
+worker's internal claim/heartbeat/ack loop.
 
 Settings resolution here is intentionally the plain dict.get(...) that
 Django's own BaseTaskBackend.__init__ already sets up as self.options —
@@ -61,35 +70,38 @@ class PostgresTaskBackend(BaseTaskBackend):
         self.broker = broker_cls(self.options)
         self.result_store = result_store_cls(self.options)
 
-    def enqueue(
+    def _enqueue_plan(
         self, task: Task[_P, _R], args: list[Any], kwargs: dict[str, Any]
-    ) -> TaskResult[_P, _R]:
+    ) -> tuple[str, QueueItem, dict[str, Any]]:
+        """Shared by enqueue/aenqueue: everything about *what* to write that
+        doesn't itself touch the DB, so neither copy has to duplicate it."""
         self.validate_task(task)
-
         result_id = str(uuid.uuid4())
         now = timezone.now()
         run_after = task.run_after or now
+        queue_item = QueueItem(
+            id=result_id, queue_name=task.queue_name, priority=task.priority, run_after=run_after
+        )
+        create_kwargs = {
+            "id": result_id,
+            "task_path": task.module_path,
+            "args": args,
+            "kwargs": kwargs,
+            "queue_name": task.queue_name,
+            "priority": task.priority,
+            "run_after": run_after,
+            "enqueued_at": now,
+            "max_retries": self.options.get("MAX_RETRIES", DEFAULT_MAX_RETRIES),
+            "delivery_guarantee": registry.delivery_guarantee_for(task.module_path),
+        }
+        return result_id, queue_item, create_kwargs
 
-        self.result_store.create(
-            id=result_id,
-            task_path=task.module_path,
-            args=args,
-            kwargs=kwargs,
-            queue_name=task.queue_name,
-            priority=task.priority,
-            run_after=run_after,
-            enqueued_at=now,
-            max_retries=self.options.get("MAX_RETRIES", DEFAULT_MAX_RETRIES),
-            delivery_guarantee=registry.delivery_guarantee_for(task.module_path),
-        )
-        self.broker.enqueue(
-            QueueItem(
-                id=result_id,
-                queue_name=task.queue_name,
-                priority=task.priority,
-                run_after=run_after,
-            )
-        )
+    def enqueue(
+        self, task: Task[_P, _R], args: list[Any], kwargs: dict[str, Any]
+    ) -> TaskResult[_P, _R]:
+        result_id, queue_item, create_kwargs = self._enqueue_plan(task, args, kwargs)
+        self.result_store.create(**create_kwargs)
+        self.broker.enqueue(queue_item)
 
         result = self.get_result(result_id)
         task_enqueued.send(type(self), task_result=result)
@@ -99,9 +111,27 @@ class PostgresTaskBackend(BaseTaskBackend):
         # signature, which does know _P/_R from the caller's `task` argument.
         return cast("TaskResult[_P, _R]", result)
 
+    async def aenqueue(
+        self, task: Task[_P, _R], args: list[Any], kwargs: dict[str, Any]
+    ) -> TaskResult[_P, _R]:
+        result_id, queue_item, create_kwargs = self._enqueue_plan(task, args, kwargs)
+        await self.result_store.acreate(**create_kwargs)
+        await self.broker.aenqueue(queue_item)
+
+        result = await self.aget_result(result_id)
+        task_enqueued.send(type(self), task_result=result)
+        return cast("TaskResult[_P, _R]", result)
+
     def get_result(self, result_id: str) -> TaskResult[..., Any]:
         try:
             row = self.result_store.get(result_id)
+        except DBTaskResult.DoesNotExist:
+            raise TaskResultDoesNotExist(result_id) from None
+        return _to_task_result(row, backend_alias=self.alias)
+
+    async def aget_result(self, result_id: str) -> TaskResult[..., Any]:
+        try:
+            row = await self.result_store.aget(result_id)
         except DBTaskResult.DoesNotExist:
             raise TaskResultDoesNotExist(result_id) from None
         return _to_task_result(row, backend_alias=self.alias)

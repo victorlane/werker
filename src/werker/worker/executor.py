@@ -1,26 +1,15 @@
-"""Bounded thread pool for sync task functions, plus the mandatory
-per-execution connection cleanup.
+"""Backwards-compatible re-export.
 
-A long-lived worker process reusing a bounded pool of threads for sync
-Django ORM/task work will otherwise leak DB connections indefinitely until
-max_connections is exhausted — the single most common real-world failure
-mode of hand-rolled DB workers. Every call routed through this pool closes
-old connections on its thread when done, success or failure.
+The actual implementation moved to werker.concurrency so it can be shared
+with werker.broker/werker.results (see werker.broker's module docstring
+for why those ABCs need their own dedicated executor too, not just the
+worker's user-task pool this module originally served).
 """
 
-from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+from functools import partial
 
-from django.db import close_old_connections
+from werker.concurrency import create_bounded_executor, run_with_connection_cleanup
 
+create_executor = partial(create_bounded_executor, thread_name_prefix="werker-sync")
 
-def create_executor(concurrency: int) -> ThreadPoolExecutor:
-    return ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="werker-sync")
-
-
-def run_with_connection_cleanup(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-    try:
-        return func(*args, **kwargs)
-    finally:
-        close_old_connections()
+__all__ = ["create_executor", "run_with_connection_cleanup"]
