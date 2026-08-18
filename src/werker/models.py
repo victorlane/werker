@@ -4,8 +4,7 @@ from django.db import models
 
 
 class TaskStatus(models.TextChoices):
-    """Mirrors django.tasks.TaskResultStatus so DBTaskResult.status maps 1:1
-    onto the values django.tasks.TaskResult.status is expected to return."""
+    """Mirrors django.tasks.TaskResultStatus."""
 
     READY = "READY", "Ready"
     RUNNING = "RUNNING", "Running"
@@ -19,32 +18,17 @@ class ScheduleKind(models.TextChoices):
 
 
 class DeliveryGuarantee(models.TextChoices):
-    """AT_LEAST_ONCE (default): the reaper (werker.worker.reaper) reclaims a
-    stale RUNNING row and retries it — task functions must be idempotent,
-    since a crash after the task body finished but before the result was
-    written can cause a genuine second execution.
-
-    AT_MOST_ONCE (opt-in via @werker.at_most_once): the reaper does NOT
-    reclaim a stale RUNNING row under this guarantee — it marks it FAILED
-    directly instead. This guarantees the task body never runs twice, at
-    the cost of the task possibly never completing if the "stale" claim
-    was actually a false positive (worker alive but slow/paused).
-
-    Neither mode is true exactly-once (guaranteed-runs-once-AND-never-lost)
-    — that isn't achievable without the task's own side effects cooperating
-    via an idempotency key, which is a pattern task authors can layer on
-    top of either mode, not something a backend can provide unilaterally.
-    """
+    """AT_LEAST_ONCE (default) retries a stale claim; task functions must be
+    idempotent. AT_MOST_ONCE (opt-in via @werker.at_most_once) never retries,
+    so it can lose a task instead of duplicating it. Neither is exactly-once."""
 
     AT_LEAST_ONCE = "AT_LEAST_ONCE", "At least once"
     AT_MOST_ONCE = "AT_MOST_ONCE", "At most once"
 
 
 class DBTaskResult(models.Model):
-    """Backs both the Broker (claim-relevant columns) and the ResultStore
-    (outcome-relevant columns) in werker's v1 Postgres implementation. See
-    the broker/results package docstrings for why these two concerns share
-    one table in v1 despite having separate ABCs."""
+    """Backs both the Broker and the ResultStore in werker's v1 Postgres
+    implementation (see werker.broker for why they share one table)."""
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
@@ -94,9 +78,8 @@ class DBTaskResult(models.Model):
 
 
 class PeriodicTask(models.Model):
-    """Declared via the `@schedule(...)` decorator (werker's own addition —
-    django.tasks itself has no scheduling concept) and synced into this
-    table idempotently by WerkerConfig.ready() / `manage.py syncschedules`."""
+    """Declared via werker's own @schedule decorator, synced into this table
+    by WerkerConfig.ready() / `manage.py syncschedules`."""
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=255, unique=True)

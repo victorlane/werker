@@ -1,11 +1,8 @@
 """PostgresBroker: SELECT ... FOR UPDATE SKIP LOCKED claim semantics.
 
-v1 shortcut, documented deliberately (see werker.broker's module docstring):
-this reads/writes the same werker.models.DBTaskResult table that
-werker.results.db.DBResultStore uses, touching only the claim-relevant
-columns (status, run_after, priority, queue_name, claimed_by, claimed_at,
-last_heartbeat_at, attempts). A future non-Postgres Broker would own its
-own physically separate storage.
+v1 shortcut: reads/writes the same DBTaskResult table DBResultStore uses,
+touching only the claim-relevant columns. A future non-Postgres Broker
+would own its own separate storage.
 """
 
 from collections.abc import Sequence
@@ -24,11 +21,7 @@ class PostgresBroker(Broker):
     supports_skip_locked = True
 
     def enqueue(self, item: QueueItem) -> None:
-        # The row is created by ResultStore.create before this runs (see
-        # PostgresTaskBackend.enqueue) — this call exists so the Broker
-        # interface has something real to do even in the shared-table v1
-        # layout, and so a future separate-storage Broker has a natural
-        # place to actually insert a queue entry.
+        # The row is created by ResultStore.create before this runs.
         DBTaskResult.objects.filter(id=item.id).update(
             queue_name=item.queue_name,
             priority=item.priority,
@@ -39,10 +32,8 @@ class PostgresBroker(Broker):
     def claim(
         self, *, queue_names: Sequence[str], limit: int, worker_id: str
     ) -> list[ClaimedItem]:
-        """The core correctness-critical claim query. A plain sync Django ORM
-        function (see werker.broker's module docstring) — also directly
-        callable from a thread pool in tests to exercise real concurrent
-        Postgres transactions without going through asyncio."""
+        """The core correctness-critical claim query. Also directly callable
+        from a thread pool in tests to exercise real concurrent transactions."""
         now = timezone.now()
         with transaction.atomic():
             ids = list(
@@ -157,7 +148,7 @@ def _reaper_error() -> dict[str, str]:
     return {
         "exception_class_path": "werker.exceptions.StaleClaimReclaimed",
         "traceback": (
-            "werker.exceptions.StaleClaimReclaimed: no heartbeat received before the "
-            "STALE_RUNNING_TIMEOUT — the worker holding this claim is presumed dead."
+            "werker.exceptions.StaleClaimReclaimed: no heartbeat received before "
+            "STALE_RUNNING_TIMEOUT, the worker holding this claim is presumed dead."
         ),
     }

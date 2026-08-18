@@ -1,11 +1,5 @@
-"""Stale-claim reclaim loop.
-
-SELECT ... FOR UPDATE SKIP LOCKED is only a lock during the claiming
-transaction; after commit, status=RUNNING is a soft lock with no DB
-backing. A hard-killed worker leaves rows RUNNING forever without this
-loop. Runs as a separate asyncio task alongside the claim loop in a
-long-running `taskworker` process (not started under --once — a one-shot
-drain has no reason to wait around checking for staleness).
+"""Stale-claim reclaim loop. A hard-killed worker leaves rows RUNNING
+forever without this. Runs alongside the claim loop, not under --once.
 """
 
 import asyncio

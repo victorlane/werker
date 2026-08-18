@@ -2,16 +2,9 @@
 concurrent claimers racing the same due rows never claim the same row
 twice, and together claim every due row exactly once.
 
-Calls PostgresBroker.claim (the canonical sync method — see werker.broker's
-module docstring on why sync is canonical and async is derived) directly
-from real OS threads via ThreadPoolExecutor, deliberately bypassing the
-async entrypoint (Broker.aclaim). aclaim's asgiref sync_to_async(
-thread_sensitive=True) wrapping is meant to pin a *single* worker
-process's own sequential DB calls onto one thread; it is not the mechanism
-that provides cross-worker safety, so routing this test through it would
-not exercise genuine concurrent Postgres transactions. Real concurrency
-happens across separate worker processes/threads each holding their own
-connection — which is exactly what this test sets up directly.
+Calls PostgresBroker.claim (the canonical sync method) directly from real
+OS threads via ThreadPoolExecutor, so each thread holds its own DB
+connection and genuinely races the others in Postgres.
 """
 
 import threading

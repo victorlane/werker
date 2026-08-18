@@ -1,4 +1,4 @@
-"""Unit tests for werker.concurrency's generic helper — no DB needed."""
+"""Unit tests for werker.concurrency's generic helper. No DB needed."""
 
 from unittest.mock import patch
 

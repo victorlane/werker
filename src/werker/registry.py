@@ -1,7 +1,5 @@
-"""Module-level registries populated at import time by werker's own
-decorators (werker.decorators). Kept as plain side-tables rather than
-mutating django.tasks.Task instances (which are frozen dataclasses) — see
-werker.decorators.at_most_once and, in a later phase, @schedule.
+"""Module-level registries populated at import time by werker's decorators.
+Plain side-tables, not attributes on Task, since Task is a frozen dataclass.
 """
 
 from werker.models import DeliveryGuarantee

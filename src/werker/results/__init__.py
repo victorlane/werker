@@ -1,16 +1,11 @@
 """The ResultStore ABC: TaskResult state, independent of queueing mechanics.
 
-`get`/`aget` return the storage-layer werker.models.DBTaskResult row, not
-django.tasks.TaskResult directly — converting into the public django.tasks
-dataclass is werker.backend.PostgresTaskBackend's job, keeping this layer's
-contract storage-shaped rather than coupled to django.tasks' public API.
+`get`/`aget` return the storage-layer DBTaskResult row, not
+django.tasks.TaskResult. Converting to that is PostgresTaskBackend's job.
 
 Sync methods are canonical; async methods run on this ResultStore's own
-dedicated executor (thread_sensitive=False), not asgiref's shared
-single-thread thread_sensitive=True executor — see werker.broker's module
-docstring for the full reasoning (identical here: DBResultStore holds no
-non-thread-safe shared resource, so there's nothing for thread_sensitive=True
-to protect, only a bottleneck for it to add).
+dedicated executor, not asgiref's shared thread_sensitive=True executor.
+See werker.broker's module docstring for why.
 """
 
 import abc

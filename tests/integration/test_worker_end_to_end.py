@@ -1,11 +1,10 @@
-"""Phase 4 checkpoint: `taskworker --once` (via Worker.run() directly, not
-the management command, for a tighter test loop) against real Postgres,
-covering both a sync and a native async @task, plus the retry/failure path.
+"""`taskworker --once` (via Worker.run() directly for a tighter test loop)
+against real Postgres, covering a sync task, a native async task, and the
+retry/failure path.
 
-Uses the `a`-prefixed async entrypoints throughout (.aenqueue/.arefresh) —
-these are async test functions, and Django's async-safety check correctly
-refuses a raw sync ORM call (like plain .enqueue()) from a thread with a
-running event loop.
+Uses the `a`-prefixed async entrypoints throughout, since these are async
+test functions and Django's async-safety check refuses a raw sync ORM
+call from a thread with a running event loop.
 """
 
 import pytest
@@ -43,8 +42,8 @@ async def test_failing_task_retries_with_backoff_by_default():
 
     await result.arefresh()
 
-    # One attempt made, default MAX_RETRIES=3 means it's still eligible for
-    # retry — back to READY with a future run_after, not terminally FAILED yet.
+    # One attempt made, default MAX_RETRIES=3, so still eligible for retry:
+    # back to READY with a future run_after, not terminally FAILED yet.
     assert result.status == TaskResultStatus.READY
     assert result.attempts == 1
     assert len(result.errors) == 1

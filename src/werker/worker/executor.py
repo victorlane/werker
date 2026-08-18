@@ -1,10 +1,4 @@
-"""Backwards-compatible re-export.
-
-The actual implementation moved to werker.concurrency so it can be shared
-with werker.broker/werker.results (see werker.broker's module docstring
-for why those ABCs need their own dedicated executor too, not just the
-worker's user-task pool this module originally served).
-"""
+"""Backwards-compatible re-export. Implementation lives in werker.concurrency."""
 
 from functools import partial
 

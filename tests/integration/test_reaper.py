@@ -1,7 +1,6 @@
-"""Phase 5 checkpoint: PostgresBroker.reclaim_stale, exercised directly
-against manually-staled rows (not via the timed reaper_loop, for
-determinism) — proves the AT_LEAST_ONCE-retries vs AT_MOST_ONCE/exhausted-
-retries-fails branch of the delivery guarantee.
+"""PostgresBroker.reclaim_stale, exercised directly against manually-staled
+rows (not the timed reaper_loop, for determinism). Proves the
+AT_LEAST_ONCE-retries vs AT_MOST_ONCE/exhausted-retries-fails branch.
 """
 
 from datetime import timedelta

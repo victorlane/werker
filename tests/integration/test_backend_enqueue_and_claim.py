@@ -1,13 +1,13 @@
-"""Phase 3 checkpoint: PostgresTaskBackend wired to real django.tasks,
-exercised end-to-end with a manual one-shot claim (no worker loop yet —
-that's phase 4). Proves @task / .enqueue() / .get_result() / .refresh()
-all work against a real Postgres, and that the Broker/ResultStore split
-composes correctly through the outer backend.
+"""PostgresTaskBackend wired to real django.tasks, exercised end-to-end
+with a manual one-shot claim. Proves @task / .enqueue() / .get_result() /
+.refresh() all work against a real Postgres, and that the Broker/ResultStore
+split composes correctly through the outer backend.
 """
 
 import pytest
 from django.tasks import task_backends
 from django.tasks.base import TaskResultStatus
+from django.tasks.exceptions import TaskResultDoesNotExist
 
 from example.demoapp.tasks import say_hello
 from werker.models import DeliveryGuarantee
@@ -49,3 +49,17 @@ def test_default_delivery_guarantee_is_at_least_once():
 
     row = DBTaskResult.objects.get(id=result.id)
     assert row.delivery_guarantee == DeliveryGuarantee.AT_LEAST_ONCE
+
+
+@pytest.mark.django_db(transaction=True)
+def test_get_result_raises_does_not_exist_for_malformed_id():
+    backend = task_backends["default"]
+    with pytest.raises(TaskResultDoesNotExist):
+        backend.get_result("not-a-valid-uuid")
+
+
+@pytest.mark.django_db(transaction=True)
+def test_get_result_raises_does_not_exist_for_well_formed_but_unknown_id():
+    backend = task_backends["default"]
+    with pytest.raises(TaskResultDoesNotExist):
+        backend.get_result("00000000-0000-0000-0000-000000000000")

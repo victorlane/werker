@@ -1,33 +1,16 @@
 """PostgresTaskBackend: the django.tasks BaseTaskBackend implementation.
 
-Composes a Broker + ResultStore (+, from phase 7, a ScheduleStore), all
-resolved from TASKS["<alias>"]["OPTIONS"]. `enqueue`/`get_result` are the
-canonical sync methods, matching django.tasks.backends.base.BaseTaskBackend
-itself.
+Composes a Broker + ResultStore, resolved from TASKS["<alias>"]["OPTIONS"].
+`enqueue`/`get_result` are the canonical sync methods, matching
+BaseTaskBackend itself.
 
-`aenqueue`/`aget_result` are explicitly overridden here too, NOT left as
-Django's inherited default `sync_to_async(self.enqueue, thread_sensitive=True)`
-wrapper — that default would route the whole call through asgiref's single
-process-wide 1-worker executor (see werker.broker's module docstring for
-why that's a real bottleneck, not just a theoretical one: it's the same
-executor every other thread_sensitive=True call in the process shares,
-including this worker's own heartbeat sends). Overriding them here to call
-straight through to Broker/ResultStore's own `a`-prefixed methods (which
-use their own dedicated executors) keeps the *entire* async path — from
-`task.aenqueue()` down to the DB — off that shared bottleneck, not just the
-worker's internal claim/heartbeat/ack loop.
+`aenqueue`/`aget_result` are explicitly overridden too, not left as
+Django's inherited thread_sensitive=True default, so the entire async path
+uses Broker/ResultStore's own dedicated executors. See werker.broker.
 
-Settings resolution here is intentionally the plain dict.get(...) that
-Django's own BaseTaskBackend.__init__ already sets up as self.options —
-the DRF-api_settings-style lazy PgOptions wrapper (validation, IMPORT_STRINGS,
-defaults) is phase 9's job, once the real set of needed options is known.
-
-Uses `from __future__ import annotations`: django-stubs types Task/TaskResult
-as Generic[_P, _R] in its .pyi stubs for mypy's benefit, but the real
-runtime classes (django.tasks.base.Task/TaskResult) are plain dataclasses,
-not actually Generic — subscripting them (e.g. `Task[_P, _R]`) blows up at
-import time unless annotations are deferred (PEP 563) rather than eagerly
-evaluated.
+Uses `from __future__ import annotations`: Task/TaskResult are typed
+Generic in django-stubs but aren't Generic at runtime, so subscripting
+them needs deferred annotation evaluation.
 """
 
 from __future__ import annotations
@@ -35,6 +18,7 @@ from __future__ import annotations
 import uuid
 from typing import Any, cast
 
+from django.core.exceptions import ValidationError
 from django.tasks.backends.base import BaseTaskBackend
 from django.tasks.base import Task, TaskError, TaskResult, TaskResultStatus
 from django.tasks.exceptions import TaskResultDoesNotExist
@@ -105,10 +89,8 @@ class PostgresTaskBackend(BaseTaskBackend):
 
         result = self.get_result(result_id)
         task_enqueued.send(type(self), task_result=result)
-        # get_result's return type is deliberately TaskResult[..., Any] (it
-        # resolves the Task generically from a stored dotted path, with no
-        # way to know _P/_R statically) — narrower than enqueue's own
-        # signature, which does know _P/_R from the caller's `task` argument.
+        # get_result resolves Task generically, so its return type is
+        # narrower than what we actually know here from `task`.
         return cast("TaskResult[_P, _R]", result)
 
     async def aenqueue(
@@ -125,14 +107,14 @@ class PostgresTaskBackend(BaseTaskBackend):
     def get_result(self, result_id: str) -> TaskResult[..., Any]:
         try:
             row = self.result_store.get(result_id)
-        except DBTaskResult.DoesNotExist:
+        except (DBTaskResult.DoesNotExist, ValidationError, ValueError):
             raise TaskResultDoesNotExist(result_id) from None
         return _to_task_result(row, backend_alias=self.alias)
 
     async def aget_result(self, result_id: str) -> TaskResult[..., Any]:
         try:
             row = await self.result_store.aget(result_id)
-        except DBTaskResult.DoesNotExist:
+        except (DBTaskResult.DoesNotExist, ValidationError, ValueError):
             raise TaskResultDoesNotExist(result_id) from None
         return _to_task_result(row, backend_alias=self.alias)
 

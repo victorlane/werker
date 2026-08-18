@@ -2,7 +2,7 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-SECRET_KEY = "not-for-production"  # noqa: S105 — demo/test project only
+SECRET_KEY = "not-for-production"  # noqa: S105 (demo/test project only)
 DEBUG = True
 
 INSTALLED_APPS = [

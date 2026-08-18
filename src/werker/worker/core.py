@@ -1,22 +1,13 @@
 """The async worker orchestration loop.
 
-Runs as a single asyncio event loop per worker process: native `async def`
-task functions are awaited directly on the loop (bounded by an
-asyncio.Semaphore so one worker doesn't try to run unbounded concurrent
-async tasks at once); sync `def` task functions run in a bounded
-ThreadPoolExecutor (werker.worker.executor) — the same
-async-on-loop/sync-in-threadpool split Starlette/FastAPI use for path
-operation functions.
+Native `async def` task functions run directly on the loop, bounded by a
+semaphore. Sync `def` task functions run in a bounded ThreadPoolExecutor,
+the same async-on-loop/sync-in-threadpool split Starlette/FastAPI use.
 
-Also handles graceful shutdown: SIGTERM/SIGINT set an asyncio.Event that
-both loops check responsively (_wait_or_shutdown), and in-flight work gets
-up to SHUTDOWN_GRACE_PERIOD to finish before being abandoned (_drain_inflight)
-— an abandoned sync task's underlying OS thread can't be force-killed (a
-hard Python limitation), so it's left to the reaper to reclaim once its
-heartbeat goes stale, same as a genuine crash.
-
-The schedule-claim loop (phase 7) is a separate asyncio task that phase 7
-will add to the same asyncio.gather(...) in run().
+Also handles graceful shutdown: SIGTERM/SIGINT set an asyncio.Event, and
+in-flight work gets up to SHUTDOWN_GRACE_PERIOD before being abandoned. An
+abandoned sync task can't be force-killed, so the reaper reclaims it once
+its heartbeat goes stale, same as a genuine crash.
 """
 
 import asyncio
@@ -121,19 +112,13 @@ class Worker:
         try:
             loops = [self._task_claim_loop()]
             if not self.once:
-                # A one-shot --once drain has no reason to wait around
-                # checking for staleness; the reaper is for long-running
-                # deployments only.
+                # --once drains and exits, no reason to wait for staleness.
                 loops.append(reaper_loop(self))
             await asyncio.gather(*loops)
         finally:
-            # wait=False deliberately: by this point _drain_inflight() has
-            # already waited up to shutdown_grace_period for in-flight work.
-            # A sync task that ignored cancellation and is still blocking a
-            # thread can't be force-killed from here (a hard Python
-            # limitation, same one Celery's prefork workers hit) — don't
-            # let that hang our own shutdown on top of the grace period
-            # we already spent.
+            # wait=False: _drain_inflight already waited up to
+            # shutdown_grace_period. A thread that ignored cancellation
+            # can't be force-killed from here, don't block on it too.
             self._executor.shutdown(wait=False, cancel_futures=True)
             logger.info("werker worker %s stopped", self.worker_id)
 
@@ -150,9 +135,7 @@ class Worker:
         return (self.concurrency + self.max_async_concurrency) - len(self._inflight)
 
     async def _wait_or_shutdown(self, timeout: float) -> None:
-        """Sleep for `timeout` seconds, but return immediately if shutdown is
-        signalled — makes SIGTERM/SIGINT responsive instead of waiting out
-        whatever's left of the current poll interval."""
+        """Sleeps up to `timeout` seconds, or returns early if shutdown fires."""
         with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(self._shutdown.wait(), timeout=timeout)
 
@@ -194,8 +177,8 @@ class Worker:
             still_running = [t for t in pending if not t.done()]
             logger.warning(
                 "werker worker %s shutdown grace period (%ss) elapsed with %d task(s) "
-                "still running — abandoning them (they'll be reclaimed by the reaper "
-                "once their heartbeat goes stale).",
+                "still running, abandoning them (the reaper will reclaim them once "
+                "their heartbeat goes stale).",
                 self.worker_id,
                 self.shutdown_grace_period,
                 len(still_running),
@@ -249,10 +232,8 @@ class Worker:
         task_finished.send(sender=type(self.backend), task_result=finished_result)
 
     async def _heartbeat_sender(self, item_id: str) -> None:
-        """Runs alongside a claimed item's execution, keeping its
-        last_heartbeat_at fresh so the reaper doesn't mistake a slow-but-
-        alive task for a crashed worker. Cancelled as soon as execution
-        finishes (see _execute's finally block)."""
+        """Keeps last_heartbeat_at fresh while item_id runs. Cancelled as soon
+        as execution finishes, see _execute's finally block."""
         while True:
             await asyncio.sleep(self.heartbeat_interval)
             await self.backend.broker.aheartbeat(item_id, worker_id=self.worker_id)

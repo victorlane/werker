@@ -1,9 +1,7 @@
-"""Proves the thread_sensitive=False fix actually works, deterministically
-(thread-identity checks, not timing — timing-based concurrency assertions
-are flaky). Before this fix, every one of these calls would have funneled
-through asgiref's single process-wide 1-worker executor
-(asgiref.sync.SyncToAsync.single_thread_executor) and every assertion here
-would fail with exactly one thread id observed.
+"""Proves the thread_sensitive=False fix works, deterministically
+(thread-identity checks, not timing). Before this fix, every one of these
+calls funneled through asgiref's single process-wide 1-worker executor
+and every assertion here would fail with exactly one thread id observed.
 """
 
 import asyncio
@@ -64,7 +62,7 @@ async def test_broker_aclaim_runs_concurrently_across_multiple_threads():
 
     assert sum(len(r) for r in results) == CONCURRENT_CALLS
     assert len(seen_thread_ids) > 1, (
-        "all claims ran on a single thread — the thread_sensitive=False fix regressed"
+        "all claims ran on a single thread, the thread_sensitive=False fix regressed"
     )
 
 
@@ -104,7 +102,7 @@ async def test_result_store_amark_successful_runs_concurrently_across_multiple_t
     )
 
     assert len(seen_thread_ids) > 1, (
-        "all mark_successful calls ran on a single thread — the fix regressed"
+        "all mark_successful calls ran on a single thread, the fix regressed"
     )
     successful_count = await sync_to_async(
         DBTaskResult.objects.filter(status=TaskStatus.SUCCESSFUL).count, thread_sensitive=True
@@ -114,10 +112,9 @@ async def test_result_store_amark_successful_runs_concurrently_across_multiple_t
 
 @pytest.mark.django_db(transaction=True)
 async def test_aenqueue_end_to_end_does_not_serialize_onto_asgirefs_shared_thread():
-    """The end-to-end proof: task.aenqueue() — the actual public API — no
-    longer funnels through PostgresTaskBackend's inherited default
-    (Django's BaseTaskBackend.aenqueue, sync_to_async(thread_sensitive=True)),
-    because PostgresTaskBackend now overrides aenqueue itself."""
+    """task.aenqueue(), the actual public API, no longer funnels through
+    PostgresTaskBackend's inherited default. PostgresTaskBackend overrides
+    aenqueue itself now."""
     seen_thread_ids: set[int] = set()
     lock = threading.Lock()
     original_create = DBResultStore.create
@@ -134,7 +131,7 @@ async def test_aenqueue_end_to_end_does_not_serialize_onto_asgirefs_shared_threa
 
     assert len(results) == CONCURRENT_CALLS
     assert len(seen_thread_ids) > 1, (
-        "aenqueue() serialized onto a single thread — PostgresTaskBackend.aenqueue "
+        "aenqueue() serialized onto a single thread, PostgresTaskBackend.aenqueue "
         "regressed to Django's default thread_sensitive=True wrapper"
     )
 
