@@ -40,6 +40,12 @@ class ClaimedItem:
     attempt: int
 
 
+@dataclass(frozen=True)
+class ReclaimedItem:
+    id: str
+    action: str  # "retried" or "failed" — see Broker.reclaim_stale
+
+
 class Broker(abc.ABC):
     #: False for a hypothetical future backend (e.g. SQLite) that cannot offer
     #: true non-blocking SKIP LOCKED semantics. Not exercised in v1 — see the
@@ -90,3 +96,22 @@ class Broker(abc.ABC):
 
     async def aheartbeat(self, item_id: str, *, worker_id: str) -> None:
         await sync_to_async(self.heartbeat, thread_sensitive=True)(item_id, worker_id=worker_id)
+
+    @abc.abstractmethod
+    def reclaim_stale(
+        self, *, stale_before: datetime, limit: int, retry_backoff_seconds: float
+    ) -> list[ReclaimedItem]:
+        """Atomically reclaim RUNNING items whose heartbeat is older than
+        stale_before: AT_LEAST_ONCE items with retries remaining go back to
+        READY (retried); AT_MOST_ONCE items, or items with no retries left,
+        go to FAILED directly (failed) — never retried, per the delivery
+        guarantee. The whole lock-then-decide-then-write must happen in one
+        transaction per item so a second reaper (or the original "zombie"
+        worker heartbeating late) can't race the decision."""
+
+    async def areclaim_stale(
+        self, *, stale_before: datetime, limit: int, retry_backoff_seconds: float
+    ) -> list[ReclaimedItem]:
+        return await sync_to_async(self.reclaim_stale, thread_sensitive=True)(
+            stale_before=stale_before, limit=limit, retry_backoff_seconds=retry_backoff_seconds
+        )

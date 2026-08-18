@@ -9,15 +9,15 @@ own physically separate storage.
 """
 
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from django.db import transaction
 from django.db.models import F
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 
-from werker.broker import Broker, ClaimedItem, QueueItem
-from werker.models import DBTaskResult, TaskStatus
+from werker.broker import Broker, ClaimedItem, QueueItem, ReclaimedItem
+from werker.models import DBTaskResult, DeliveryGuarantee, TaskStatus
 
 
 class PostgresBroker(Broker):
@@ -90,3 +90,74 @@ class PostgresBroker(Broker):
         DBTaskResult.objects.filter(id=item_id, claimed_by=worker_id).update(
             last_heartbeat_at=timezone.now()
         )
+
+    def reclaim_stale(
+        self, *, stale_before: datetime, limit: int, retry_backoff_seconds: float
+    ) -> list[ReclaimedItem]:
+        now = timezone.now()
+        with transaction.atomic():
+            ids = list(
+                DBTaskResult.objects.select_for_update(skip_locked=True)
+                .filter(status=TaskStatus.RUNNING, last_heartbeat_at__lt=stale_before)
+                .order_by("last_heartbeat_at")
+                .values_list("id", flat=True)[:limit]
+            )
+            if not ids:
+                return []
+
+            rows = list(
+                DBTaskResult.objects.filter(id__in=ids).values(
+                    "id", "delivery_guarantee", "attempts", "max_retries", "errors"
+                )
+            )
+
+            retry_ids = []
+            fail_rows = []
+            for row in rows:
+                can_retry = (
+                    row["delivery_guarantee"] == DeliveryGuarantee.AT_LEAST_ONCE
+                    and row["attempts"] < row["max_retries"]
+                )
+                if can_retry:
+                    retry_ids.append(row["id"])
+                else:
+                    fail_rows.append(row)
+
+            if retry_ids:
+                DBTaskResult.objects.filter(id__in=retry_ids).update(
+                    status=TaskStatus.READY,
+                    run_after=now + timedelta(seconds=retry_backoff_seconds),
+                    claimed_by="",
+                    claimed_at=None,
+                    last_heartbeat_at=None,
+                )
+
+            for row in fail_rows:
+                errors = [*row["errors"], _reaper_error()]
+                DBTaskResult.objects.filter(id=row["id"]).update(
+                    status=TaskStatus.FAILED,
+                    finished_at=now,
+                    errors=errors,
+                    claimed_by="",
+                    claimed_at=None,
+                    last_heartbeat_at=None,
+                )
+
+        fail_ids = {row["id"] for row in fail_rows}
+        return [
+            ReclaimedItem(
+                id=str(row["id"]),
+                action="failed" if row["id"] in fail_ids else "retried",
+            )
+            for row in rows
+        ]
+
+
+def _reaper_error() -> dict:
+    return {
+        "exception_class_path": "werker.exceptions.StaleClaimReclaimed",
+        "traceback": (
+            "werker.exceptions.StaleClaimReclaimed: no heartbeat received before the "
+            "STALE_RUNNING_TIMEOUT — the worker holding this claim is presumed dead."
+        ),
+    }

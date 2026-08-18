@@ -14,6 +14,7 @@ phase 5/7 will add to the same asyncio.gather(...) in run().
 """
 
 import asyncio
+import contextlib
 import functools
 import logging
 import os
@@ -32,6 +33,7 @@ from django.utils.json import normalize_json
 
 from werker.broker import ClaimedItem
 from werker.worker.executor import create_executor, run_with_connection_cleanup
+from werker.worker.reaper import reaper_loop
 
 logger = logging.getLogger("werker.worker")
 
@@ -42,6 +44,9 @@ DEFAULT_CLAIM_BATCH_SIZE = 10
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_RETRY_BACKOFF_BASE = 2.0
 DEFAULT_RETRY_BACKOFF_MAX = 300
+DEFAULT_HEARTBEAT_INTERVAL = 15
+DEFAULT_STALE_RUNNING_TIMEOUT = 300
+DEFAULT_REAPER_POLL_INTERVAL = 30
 
 
 def make_worker_id() -> str:
@@ -68,6 +73,13 @@ class Worker:
         self.max_retries = options.get("MAX_RETRIES", DEFAULT_MAX_RETRIES)
         self.retry_backoff_base = options.get("RETRY_BACKOFF_BASE", DEFAULT_RETRY_BACKOFF_BASE)
         self.retry_backoff_max = options.get("RETRY_BACKOFF_MAX", DEFAULT_RETRY_BACKOFF_MAX)
+        self.heartbeat_interval = options.get("HEARTBEAT_INTERVAL", DEFAULT_HEARTBEAT_INTERVAL)
+        self.stale_running_timeout = options.get(
+            "STALE_RUNNING_TIMEOUT", DEFAULT_STALE_RUNNING_TIMEOUT
+        )
+        self.reaper_poll_interval = options.get(
+            "REAPER_POLL_INTERVAL", DEFAULT_REAPER_POLL_INTERVAL
+        )
 
         self._executor = create_executor(self.concurrency)
         self._async_semaphore = asyncio.Semaphore(self.max_async_concurrency)
@@ -83,7 +95,13 @@ class Worker:
             self.queues,
         )
         try:
-            await self._task_claim_loop()
+            loops = [self._task_claim_loop()]
+            if not self.once:
+                # A one-shot --once drain has no reason to wait around
+                # checking for staleness; the reaper is for long-running
+                # deployments only.
+                loops.append(reaper_loop(self))
+            await asyncio.gather(*loops)
         finally:
             self._executor.shutdown(wait=True)
             logger.info("werker worker %s stopped", self.worker_id)
@@ -141,6 +159,7 @@ class Worker:
             else tuple(result.args)
         )
 
+        heartbeat_sender = asyncio.ensure_future(self._heartbeat_sender(item.id))
         try:
             if iscoroutinefunction(task.func):
                 async with self._async_semaphore:
@@ -162,9 +181,22 @@ class Worker:
                 item.id, return_value=normalize_json(raw_return_value)
             )
             await self.backend.broker.aack(item.id)
+        finally:
+            heartbeat_sender.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat_sender
 
         finished_result = await self.backend.aget_result(item.id)
         task_finished.send(sender=type(self.backend), task_result=finished_result)
+
+    async def _heartbeat_sender(self, item_id: str) -> None:
+        """Runs alongside a claimed item's execution, keeping its
+        last_heartbeat_at fresh so the reaper doesn't mistake a slow-but-
+        alive task for a crashed worker. Cancelled as soon as execution
+        finishes (see _execute's finally block)."""
+        while True:
+            await asyncio.sleep(self.heartbeat_interval)
+            await self.backend.broker.aheartbeat(item_id, worker_id=self.worker_id)
 
     async def _handle_failure(self, item: ClaimedItem, exc: BaseException) -> None:
         exception_type = type(exc)
