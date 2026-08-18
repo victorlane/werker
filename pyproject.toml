@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "werker"
+version = "0.1.0.dev0"
+description = "Self-contained Postgres-backed background tasks and scheduling for Django's native task framework."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "Victor Brinkhorst" }]
+dependencies = [
+    "django>=6.0",
+    "asgiref>=3.8",
+    "croniter>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-django>=4.9",
+    "pytest-asyncio>=0.24",
+    "factory-boy>=3.3",
+    "testcontainers[postgres]>=4.8",
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "django-stubs[compatible-mypy]>=5.1",
+    "psycopg[binary]>=3.2",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["**/migrations/*.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "DJ", "S", "RUF", "UP", "B"]
+per-file-ignores = { "tests/**/*.py" = ["S101"], "src/werker/models.py" = ["RUF012"], "src/werker/admin.py" = ["RUF012"] }
+
+[tool.mypy]
+plugins = ["mypy_django_plugin.main"]
+strict = true
+
+[tool.django-stubs]
+django_settings_module = "example.config.settings"
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "example.config.settings"
+python_files = ["test_*.py"]
+testpaths = ["tests"]
+asyncio_mode = "auto"
