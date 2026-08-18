@@ -8,9 +8,15 @@ ThreadPoolExecutor (werker.worker.executor) — the same
 async-on-loop/sync-in-threadpool split Starlette/FastAPI use for path
 operation functions.
 
-Only the task-claim loop exists as of phase 4. The schedule-claim loop
-(phase 7) and the reaper loop (phase 5) are separate asyncio tasks that
-phase 5/7 will add to the same asyncio.gather(...) in run().
+Also handles graceful shutdown: SIGTERM/SIGINT set an asyncio.Event that
+both loops check responsively (_wait_or_shutdown), and in-flight work gets
+up to SHUTDOWN_GRACE_PERIOD to finish before being abandoned (_drain_inflight)
+— an abandoned sync task's underlying OS thread can't be force-killed (a
+hard Python limitation), so it's left to the reaper to reclaim once its
+heartbeat goes stale, same as a genuine crash.
+
+The schedule-claim loop (phase 7) is a separate asyncio task that phase 7
+will add to the same asyncio.gather(...) in run().
 """
 
 import asyncio
@@ -25,12 +31,14 @@ import uuid
 from datetime import timedelta
 from inspect import iscoroutinefunction
 
+from django.core.exceptions import ImproperlyConfigured
 from django.tasks import task_backends
 from django.tasks.base import TaskContext
 from django.tasks.signals import task_finished, task_started
 from django.utils import timezone
 from django.utils.json import normalize_json
 
+from werker.backend import PostgresTaskBackend
 from werker.broker import ClaimedItem
 from werker.worker.executor import create_executor, run_with_connection_cleanup
 from werker.worker.reaper import reaper_loop
@@ -47,6 +55,7 @@ DEFAULT_RETRY_BACKOFF_MAX = 300
 DEFAULT_HEARTBEAT_INTERVAL = 15
 DEFAULT_STALE_RUNNING_TIMEOUT = 300
 DEFAULT_REAPER_POLL_INTERVAL = 30
+DEFAULT_SHUTDOWN_GRACE_PERIOD = 30
 
 
 def make_worker_id() -> str:
@@ -58,33 +67,48 @@ class Worker:
         self, alias: str = "default", *, queues: list[str] | None = None, once: bool = False
     ):
         self.alias = alias
-        self.backend = task_backends[alias]
+        backend = task_backends[alias]
+        if not isinstance(backend, PostgresTaskBackend):
+            raise ImproperlyConfigured(
+                f"werker.worker.Worker requires TASKS[{alias!r}] to use "
+                f"werker.backend.PostgresTaskBackend, got {type(backend).__name__}."
+            )
+        self.backend = backend
         self.queues = list(queues) if queues else list(self.backend.queues)
         self.once = once
         self.worker_id = make_worker_id()
 
         options = self.backend.options
-        self.concurrency = options.get("CONCURRENCY", DEFAULT_CONCURRENCY)
-        self.max_async_concurrency = options.get(
+        self.concurrency: int = options.get("CONCURRENCY", DEFAULT_CONCURRENCY)
+        self.max_async_concurrency: int = options.get(
             "MAX_ASYNC_CONCURRENCY", DEFAULT_MAX_ASYNC_CONCURRENCY
         )
-        self.poll_interval = options.get("POLL_INTERVAL", DEFAULT_POLL_INTERVAL)
-        self.claim_batch_size = options.get("CLAIM_BATCH_SIZE", DEFAULT_CLAIM_BATCH_SIZE)
-        self.max_retries = options.get("MAX_RETRIES", DEFAULT_MAX_RETRIES)
-        self.retry_backoff_base = options.get("RETRY_BACKOFF_BASE", DEFAULT_RETRY_BACKOFF_BASE)
-        self.retry_backoff_max = options.get("RETRY_BACKOFF_MAX", DEFAULT_RETRY_BACKOFF_MAX)
-        self.heartbeat_interval = options.get("HEARTBEAT_INTERVAL", DEFAULT_HEARTBEAT_INTERVAL)
-        self.stale_running_timeout = options.get(
+        self.poll_interval: float = options.get("POLL_INTERVAL", DEFAULT_POLL_INTERVAL)
+        self.claim_batch_size: int = options.get("CLAIM_BATCH_SIZE", DEFAULT_CLAIM_BATCH_SIZE)
+        self.max_retries: int = options.get("MAX_RETRIES", DEFAULT_MAX_RETRIES)
+        self.retry_backoff_base: float = options.get(
+            "RETRY_BACKOFF_BASE", DEFAULT_RETRY_BACKOFF_BASE
+        )
+        self.retry_backoff_max: float = options.get(
+            "RETRY_BACKOFF_MAX", DEFAULT_RETRY_BACKOFF_MAX
+        )
+        self.heartbeat_interval: float = options.get(
+            "HEARTBEAT_INTERVAL", DEFAULT_HEARTBEAT_INTERVAL
+        )
+        self.stale_running_timeout: float = options.get(
             "STALE_RUNNING_TIMEOUT", DEFAULT_STALE_RUNNING_TIMEOUT
         )
-        self.reaper_poll_interval = options.get(
+        self.reaper_poll_interval: float = options.get(
             "REAPER_POLL_INTERVAL", DEFAULT_REAPER_POLL_INTERVAL
+        )
+        self.shutdown_grace_period: float = options.get(
+            "SHUTDOWN_GRACE_PERIOD", DEFAULT_SHUTDOWN_GRACE_PERIOD
         )
 
         self._executor = create_executor(self.concurrency)
         self._async_semaphore = asyncio.Semaphore(self.max_async_concurrency)
         self._shutdown = asyncio.Event()
-        self._inflight: set[asyncio.Task] = set()
+        self._inflight: set[asyncio.Task[None]] = set()
 
     async def run(self) -> None:
         self._install_signal_handlers()
@@ -103,7 +127,14 @@ class Worker:
                 loops.append(reaper_loop(self))
             await asyncio.gather(*loops)
         finally:
-            self._executor.shutdown(wait=True)
+            # wait=False deliberately: by this point _drain_inflight() has
+            # already waited up to shutdown_grace_period for in-flight work.
+            # A sync task that ignored cancellation and is still blocking a
+            # thread can't be force-killed from here (a hard Python
+            # limitation, same one Celery's prefork workers hit) — don't
+            # let that hang our own shutdown on top of the grace period
+            # we already spent.
+            self._executor.shutdown(wait=False, cancel_futures=True)
             logger.info("werker worker %s stopped", self.worker_id)
 
     def _install_signal_handlers(self) -> None:
@@ -118,11 +149,18 @@ class Worker:
     def _available_capacity(self) -> int:
         return (self.concurrency + self.max_async_concurrency) - len(self._inflight)
 
+    async def _wait_or_shutdown(self, timeout: float) -> None:
+        """Sleep for `timeout` seconds, but return immediately if shutdown is
+        signalled — makes SIGTERM/SIGINT responsive instead of waiting out
+        whatever's left of the current poll interval."""
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(self._shutdown.wait(), timeout=timeout)
+
     async def _task_claim_loop(self) -> None:
         while not self._shutdown.is_set():
             capacity = self._available_capacity()
             if capacity <= 0:
-                await asyncio.sleep(self.poll_interval)
+                await self._wait_or_shutdown(self.poll_interval)
                 continue
 
             limit = min(capacity, self.claim_batch_size)
@@ -133,7 +171,7 @@ class Worker:
             if not claimed:
                 if self.once:
                     break
-                await asyncio.sleep(self.poll_interval)
+                await self._wait_or_shutdown(self.poll_interval)
                 continue
 
             for item in claimed:
@@ -141,8 +179,29 @@ class Worker:
                 self._inflight.add(task_coro)
                 task_coro.add_done_callback(self._inflight.discard)
 
-        if self._inflight:
-            await asyncio.gather(*self._inflight, return_exceptions=True)
+        await self._drain_inflight()
+
+    async def _drain_inflight(self) -> None:
+        if not self._inflight:
+            return
+        pending = list(self._inflight)
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*pending, return_exceptions=True),
+                timeout=None if self.once else self.shutdown_grace_period,
+            )
+        except TimeoutError:
+            still_running = [t for t in pending if not t.done()]
+            logger.warning(
+                "werker worker %s shutdown grace period (%ss) elapsed with %d task(s) "
+                "still running — abandoning them (they'll be reclaimed by the reaper "
+                "once their heartbeat goes stale).",
+                self.worker_id,
+                self.shutdown_grace_period,
+                len(still_running),
+            )
+            for t in still_running:
+                t.cancel()
 
     async def _execute(self, item: ClaimedItem) -> None:
         result = await self.backend.aget_result(item.id)

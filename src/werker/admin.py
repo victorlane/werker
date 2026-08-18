@@ -4,7 +4,7 @@ from werker.models import DBTaskResult, PeriodicTask
 
 
 @admin.register(DBTaskResult)
-class DBTaskResultAdmin(admin.ModelAdmin):
+class DBTaskResultAdmin(admin.ModelAdmin):  # type: ignore[type-arg]
     list_display = (
         "id",
         "task_path",
@@ -21,7 +21,7 @@ class DBTaskResultAdmin(admin.ModelAdmin):
 
 
 @admin.register(PeriodicTask)
-class PeriodicTaskAdmin(admin.ModelAdmin):
+class PeriodicTaskAdmin(admin.ModelAdmin):  # type: ignore[type-arg]
     list_display = (
         "name",
         "task_path",

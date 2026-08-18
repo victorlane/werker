@@ -13,8 +13,8 @@ class DBResultStore(ResultStore):
         *,
         id: str,
         task_path: str,
-        args: tuple,
-        kwargs: dict,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
         queue_name: str,
         priority: int,
         run_after: datetime,
@@ -48,10 +48,10 @@ class DBResultStore(ResultStore):
             finished_at=timezone.now(),
         )
 
-    def mark_failed(self, id: str, *, error: dict, will_retry: bool) -> None:
+    def mark_failed(self, id: str, *, error: dict[str, str], will_retry: bool) -> None:
         result = DBTaskResult.objects.get(id=id)
         result.errors.append(error)
-        update_fields = {"errors": result.errors}
+        update_fields: dict[str, Any] = {"errors": result.errors}
         if not will_retry:
             update_fields["status"] = TaskStatus.FAILED
             update_fields["finished_at"] = timezone.now()

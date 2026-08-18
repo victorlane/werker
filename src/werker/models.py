@@ -89,7 +89,7 @@ class DBTaskResult(models.Model):
             ),
         ]
 
-    def __str__(self):
+    def __str__(self) -> str:
         return f"{self.task_path} [{self.status}] ({self.id})"
 
 
@@ -133,5 +133,5 @@ class PeriodicTask(models.Model):
             models.Index(fields=["enabled", "next_run_at"], name="werker_schedule_idx"),
         ]
 
-    def __str__(self):
+    def __str__(self) -> str:
         return self.name

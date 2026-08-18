@@ -1,6 +1,7 @@
 import asyncio
+from typing import Any
 
-from django.core.management.base import BaseCommand
+from django.core.management.base import BaseCommand, CommandParser
 
 from werker.worker.core import Worker
 
@@ -8,7 +9,7 @@ from werker.worker.core import Worker
 class Command(BaseCommand):
     help = "Run a werker task worker: claims and executes due tasks from the Postgres-backed queue."
 
-    def add_arguments(self, parser):
+    def add_arguments(self, parser: CommandParser) -> None:
         parser.add_argument(
             "--backend",
             default="default",
@@ -31,7 +32,7 @@ class Command(BaseCommand):
             ),
         )
 
-    def handle(self, *args, **options):
+    def handle(self, *args: Any, **options: Any) -> None:
         queues = options["queues"].split(",") if options["queues"] else None
         worker = Worker(alias=options["backend"], queues=queues, once=options["once"])
         asyncio.run(worker.run())

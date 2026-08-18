@@ -12,20 +12,34 @@ Settings resolution here is intentionally the plain dict.get(...) that
 Django's own BaseTaskBackend.__init__ already sets up as self.options —
 the DRF-api_settings-style lazy PgOptions wrapper (validation, IMPORT_STRINGS,
 defaults) is phase 9's job, once the real set of needed options is known.
+
+Uses `from __future__ import annotations`: django-stubs types Task/TaskResult
+as Generic[_P, _R] in its .pyi stubs for mypy's benefit, but the real
+runtime classes (django.tasks.base.Task/TaskResult) are plain dataclasses,
+not actually Generic — subscripting them (e.g. `Task[_P, _R]`) blows up at
+import time unless annotations are deferred (PEP 563) rather than eagerly
+evaluated.
 """
 
+from __future__ import annotations
+
 import uuid
+from typing import Any, cast
 
 from django.tasks.backends.base import BaseTaskBackend
-from django.tasks.base import TaskError, TaskResult, TaskResultStatus
+from django.tasks.base import Task, TaskError, TaskResult, TaskResultStatus
 from django.tasks.exceptions import TaskResultDoesNotExist
 from django.tasks.signals import task_enqueued
 from django.utils import timezone
 from django.utils.module_loading import import_string
+from typing_extensions import ParamSpec, TypeVar
 
 from werker import registry
 from werker.broker import QueueItem
 from werker.models import DBTaskResult, TaskStatus
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
 
 DEFAULT_BROKER_CLASS = "werker.broker.postgres.PostgresBroker"
 DEFAULT_RESULT_STORE_CLASS = "werker.results.db.DBResultStore"
@@ -38,7 +52,7 @@ class PostgresTaskBackend(BaseTaskBackend):
     supports_get_result = True
     supports_priority = True
 
-    def __init__(self, alias, params):
+    def __init__(self, alias: str, params: dict[str, Any]) -> None:
         super().__init__(alias, params)
         broker_cls = import_string(self.options.get("BROKER_CLASS", DEFAULT_BROKER_CLASS))
         result_store_cls = import_string(
@@ -47,7 +61,9 @@ class PostgresTaskBackend(BaseTaskBackend):
         self.broker = broker_cls(self.options)
         self.result_store = result_store_cls(self.options)
 
-    def enqueue(self, task, args, kwargs):
+    def enqueue(
+        self, task: Task[_P, _R], args: list[Any], kwargs: dict[str, Any]
+    ) -> TaskResult[_P, _R]:
         self.validate_task(task)
 
         result_id = str(uuid.uuid4())
@@ -77,9 +93,13 @@ class PostgresTaskBackend(BaseTaskBackend):
 
         result = self.get_result(result_id)
         task_enqueued.send(type(self), task_result=result)
-        return result
+        # get_result's return type is deliberately TaskResult[..., Any] (it
+        # resolves the Task generically from a stored dotted path, with no
+        # way to know _P/_R statically) — narrower than enqueue's own
+        # signature, which does know _P/_R from the caller's `task` argument.
+        return cast("TaskResult[_P, _R]", result)
 
-    def get_result(self, result_id):
+    def get_result(self, result_id: str) -> TaskResult[..., Any]:
         try:
             row = self.result_store.get(result_id)
         except DBTaskResult.DoesNotExist:
@@ -87,9 +107,9 @@ class PostgresTaskBackend(BaseTaskBackend):
         return _to_task_result(row, backend_alias=self.alias)
 
 
-def _to_task_result(row: DBTaskResult, *, backend_alias: str) -> TaskResult:
+def _to_task_result(row: DBTaskResult, *, backend_alias: str) -> TaskResult[..., Any]:
     task = import_string(row.task_path)
-    result = TaskResult(
+    result: TaskResult[..., Any] = TaskResult(
         task=task,
         id=str(row.id),
         status=TaskResultStatus(row.status),

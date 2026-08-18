@@ -1,7 +1,13 @@
+from __future__ import annotations
+
+from typing import Any
+
+from django.tasks.base import Task
+
 from werker import registry
 
 
-def at_most_once(task):
+def at_most_once(task: Task[..., Any]) -> Task[..., Any]:
     """Opt a @task into AT_MOST_ONCE delivery.
 
     Default delivery (no decorator) is AT_LEAST_ONCE: if a worker dies

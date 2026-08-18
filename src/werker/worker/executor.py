@@ -19,7 +19,7 @@ def create_executor(concurrency: int) -> ThreadPoolExecutor:
     return ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="werker-sync")
 
 
-def run_with_connection_cleanup(func: Callable[..., Any], *args, **kwargs) -> Any:
+def run_with_connection_cleanup(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
     try:
         return func(*args, **kwargs)
     finally:

@@ -11,13 +11,17 @@ drain has no reason to wait around checking for staleness).
 import asyncio
 import logging
 from datetime import timedelta
+from typing import TYPE_CHECKING
 
 from django.utils import timezone
+
+if TYPE_CHECKING:
+    from werker.worker.core import Worker
 
 logger = logging.getLogger("werker.worker")
 
 
-async def reaper_loop(worker) -> None:
+async def reaper_loop(worker: "Worker") -> None:
     while not worker._shutdown.is_set():
         try:
             await asyncio.wait_for(

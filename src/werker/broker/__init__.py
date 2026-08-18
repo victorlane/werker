@@ -20,7 +20,7 @@ import abc
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from asgiref.sync import sync_to_async
 
@@ -52,7 +52,7 @@ class Broker(abc.ABC):
     #: "Known risks / non-goals" section of the project plan.
     supports_skip_locked: ClassVar[bool] = True
 
-    def __init__(self, options):
+    def __init__(self, options: Any):
         self.options = options
 
     @abc.abstractmethod

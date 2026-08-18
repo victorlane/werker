@@ -19,7 +19,7 @@ from werker.models import DBTaskResult, DeliveryGuarantee
 
 
 class ResultStore(abc.ABC):
-    def __init__(self, options):
+    def __init__(self, options: Any):
         self.options = options
 
     @abc.abstractmethod
@@ -28,8 +28,8 @@ class ResultStore(abc.ABC):
         *,
         id: str,
         task_path: str,
-        args: tuple,
-        kwargs: dict,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
         queue_name: str,
         priority: int,
         run_after: datetime,
@@ -38,7 +38,7 @@ class ResultStore(abc.ABC):
         delivery_guarantee: DeliveryGuarantee = DeliveryGuarantee.AT_LEAST_ONCE,
     ) -> None: ...
 
-    async def acreate(self, **kwargs) -> None:
+    async def acreate(self, **kwargs: Any) -> None:
         await sync_to_async(self.create, thread_sensitive=True)(**kwargs)
 
     @abc.abstractmethod
@@ -58,9 +58,9 @@ class ResultStore(abc.ABC):
         )
 
     @abc.abstractmethod
-    def mark_failed(self, id: str, *, error: dict, will_retry: bool) -> None: ...
+    def mark_failed(self, id: str, *, error: dict[str, str], will_retry: bool) -> None: ...
 
-    async def amark_failed(self, id: str, *, error: dict, will_retry: bool) -> None:
+    async def amark_failed(self, id: str, *, error: dict[str, str], will_retry: bool) -> None:
         await sync_to_async(self.mark_failed, thread_sensitive=True)(
             id, error=error, will_retry=will_retry
         )

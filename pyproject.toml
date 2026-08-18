@@ -44,6 +44,13 @@ per-file-ignores = { "tests/**/*.py" = ["S101"], "src/werker/models.py" = ["RUF0
 [tool.mypy]
 plugins = ["mypy_django_plugin.main"]
 strict = true
+mypy_path = "src"
+files = ["src/werker"]
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+check_untyped_defs = true
 
 [tool.django-stubs]
 django_settings_module = "example.config.settings"

@@ -153,7 +153,7 @@ class PostgresBroker(Broker):
         ]
 
 
-def _reaper_error() -> dict:
+def _reaper_error() -> dict[str, str]:
     return {
         "exception_class_path": "werker.exceptions.StaleClaimReclaimed",
         "traceback": (
