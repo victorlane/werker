@@ -1,6 +1,6 @@
 # werker
 
-Self-contained, Postgres-backed background tasks for Django's native `django.tasks` framework. No Redis, no Celery, no separate broker.
+Self-contained, Postgres-backed background tasks for Django's native `django.tasks` framework. No Redis, no separate broker or infra, just your existing database.
 
 ## Quickstart
 
