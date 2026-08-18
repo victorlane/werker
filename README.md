@@ -53,3 +53,15 @@ result = await send_welcome_email.aenqueue(user_id=42)
 await result.arefresh()
 result.return_value
 ```
+
+Waiting synchronously for a result to finish:
+
+```python
+import time
+
+result = send_welcome_email.enqueue(user_id=42)
+while not result.is_finished:
+    time.sleep(0.5)
+    result.refresh()
+result.return_value
+```

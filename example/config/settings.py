@@ -4,6 +4,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 SECRET_KEY = "not-for-production"  # noqa: S105 (demo/test project only)
 DEBUG = True
+ALLOWED_HOSTS = ["*"]
 
 INSTALLED_APPS = [
     "django.contrib.contenttypes",
@@ -23,7 +24,7 @@ MIDDLEWARE = [
     "django.contrib.messages.middleware.MessageMiddleware",
 ]
 
-ROOT_URLCONF = None
+ROOT_URLCONF = "example.config.urls"
 
 TEMPLATES = [
     {
@@ -55,6 +56,8 @@ USE_TZ = True
 TIME_ZONE = "UTC"
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+
+STATIC_URL = "static/"
 
 TASKS = {
     "default": {
