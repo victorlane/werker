@@ -30,6 +30,7 @@ from typing_extensions import ParamSpec, TypeVar
 from werker import registry
 from werker.broker import QueueItem
 from werker.models import DBTaskResult, TaskStatus
+from werker.schedules.registry import ScheduleDeclaration
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
@@ -53,6 +54,36 @@ class PostgresTaskBackend(BaseTaskBackend):
         )
         self.broker = broker_cls(self.options)
         self.result_store = result_store_cls(self.options)
+
+    def enqueue_schedule(self, declaration: ScheduleDeclaration) -> str:
+        """Enqueues one due periodic-task occurrence, mirroring enqueue() but
+        seeded from a ScheduleDeclaration. Queues even if the underlying task
+        isn't imported yet, since DBTaskResult stores task_path as a string."""
+        now = timezone.now()
+        result_id = str(uuid.uuid4())
+        self._write_enqueue(
+            QueueItem(
+                id=result_id,
+                queue_name=declaration.queue_name,
+                priority=declaration.priority,
+                run_after=now,
+            ),
+            {
+                "id": result_id,
+                "task_path": declaration.task_path,
+                "args": list(declaration.args),
+                "kwargs": dict(declaration.kwargs),
+                "queue_name": declaration.queue_name,
+                "priority": declaration.priority,
+                "run_after": now,
+                "enqueued_at": now,
+                "max_retries": self.options.get("MAX_RETRIES", DEFAULT_MAX_RETRIES),
+                "delivery_guarantee": registry.delivery_guarantee_for(
+                    declaration.task_path
+                ),
+            },
+        )
+        return result_id
 
     def _enqueue_plan(
         self, task: Task[_P, _R], args: list[Any], kwargs: dict[str, Any]
@@ -80,12 +111,20 @@ class PostgresTaskBackend(BaseTaskBackend):
         }
         return result_id, queue_item, create_kwargs
 
+    def _write_enqueue(self, queue_item: QueueItem, create_kwargs: dict[str, Any]) -> None:
+        """create + enqueue in one transaction: a failed broker.enqueue must
+        not leave a READY row with nothing pointing at it."""
+        from django.db import transaction
+
+        with transaction.atomic():
+            self.result_store.create(**create_kwargs)
+            self.broker.enqueue(queue_item)
+
     def enqueue(
         self, task: Task[_P, _R], args: list[Any], kwargs: dict[str, Any]
     ) -> TaskResult[_P, _R]:
         result_id, queue_item, create_kwargs = self._enqueue_plan(task, args, kwargs)
-        self.result_store.create(**create_kwargs)
-        self.broker.enqueue(queue_item)
+        self._write_enqueue(queue_item, create_kwargs)
 
         result = self.get_result(result_id)
         task_enqueued.send(type(self), task_result=result)
@@ -97,8 +136,11 @@ class PostgresTaskBackend(BaseTaskBackend):
         self, task: Task[_P, _R], args: list[Any], kwargs: dict[str, Any]
     ) -> TaskResult[_P, _R]:
         result_id, queue_item, create_kwargs = self._enqueue_plan(task, args, kwargs)
-        await self.result_store.acreate(**create_kwargs)
-        await self.broker.aenqueue(queue_item)
+        # Run the sync create+enqueue block on the ResultStore's dedicated
+        # executor so both land in one transaction, same as enqueue().
+        await self.result_store._run_sync(
+            self._write_enqueue, queue_item, create_kwargs
+        )
 
         result = await self.aget_result(result_id)
         task_enqueued.send(type(self), task_result=result)
