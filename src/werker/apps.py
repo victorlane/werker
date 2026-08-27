@@ -8,5 +8,14 @@ class WerkerConfig(AppConfig):
     default_auto_field = "django.db.models.BigAutoField"
 
     def ready(self) -> None:
-        # Autodiscovery and in-process autostart land in later phases.
-        pass
+        # Import `<app>.tasks` for every installed app so @task/@schedule/
+        # @at_most_once decorators register at startup, even when nothing
+        # else imports those modules. Called once the app registry is ready.
+        from werker.schedules.discovery import discover_task_modules
+
+        discover_task_modules()
+
+        # runserver-only in-process worker autostart (see werker.worker.autostart).
+        from werker.worker.autostart import AutostartManager
+
+        AutostartManager.start_if_requested()
