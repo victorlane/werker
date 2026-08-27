@@ -1,6 +1,7 @@
 from django.tasks import task
 
 from werker.decorators import at_most_once
+from werker.schedules.decorators import schedule
 
 
 @task
@@ -22,3 +23,9 @@ def send_notification(user_id: int) -> str:
 @task
 def always_fails() -> None:
     raise ValueError("boom")
+
+
+@schedule(every=60, name="say-hello-hourly")
+@task
+def say_hello_scheduled() -> str:
+    return "hello, scheduled"

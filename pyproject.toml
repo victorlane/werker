@@ -52,6 +52,10 @@ module = "tests.*"
 disallow_untyped_defs = false
 check_untyped_defs = true
 
+[[tool.mypy.overrides]]
+module = "croniter.*"
+ignore_missing_imports = true
+
 [tool.django-stubs]
 django_settings_module = "example.config.settings"
 

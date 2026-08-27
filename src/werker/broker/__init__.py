@@ -132,3 +132,15 @@ class Broker(abc.ABC):
             limit=limit,
             retry_backoff_seconds=retry_backoff_seconds,
         )
+
+    @abc.abstractmethod
+    def claim_due_schedules(self, *, limit: int, worker_id: str) -> list[str]:
+        """Atomically claims due, enabled PeriodicTask rows (SKIP LOCKED)
+        and returns their ids. Locks the rows so the scheduler's dispatch
+        step can decide catch-up and advance next_run_at without racing
+        another worker."""
+
+    async def aclaim_due_schedules(self, *, limit: int, worker_id: str) -> list[str]:
+        return await self._run_sync(
+            self.claim_due_schedules, limit=limit, worker_id=worker_id
+        )

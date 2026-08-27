@@ -33,6 +33,7 @@ from werker.backend import PostgresTaskBackend
 from werker.broker import ClaimedItem
 from werker.worker.executor import create_executor, run_with_connection_cleanup
 from werker.worker.reaper import reaper_loop
+from werker.worker.scheduler import scheduler_loop
 
 logger = logging.getLogger("werker.worker")
 
@@ -46,6 +47,7 @@ DEFAULT_RETRY_BACKOFF_MAX = 300
 DEFAULT_HEARTBEAT_INTERVAL = 15
 DEFAULT_STALE_RUNNING_TIMEOUT = 300
 DEFAULT_REAPER_POLL_INTERVAL = 30
+DEFAULT_SCHEDULER_POLL_INTERVAL = 30
 DEFAULT_SHUTDOWN_GRACE_PERIOD = 30
 
 
@@ -92,6 +94,9 @@ class Worker:
         self.reaper_poll_interval: float = options.get(
             "REAPER_POLL_INTERVAL", DEFAULT_REAPER_POLL_INTERVAL
         )
+        self.scheduler_poll_interval: float = options.get(
+            "SCHEDULER_POLL_INTERVAL", DEFAULT_SCHEDULER_POLL_INTERVAL
+        )
         self.shutdown_grace_period: float = options.get(
             "SHUTDOWN_GRACE_PERIOD", DEFAULT_SHUTDOWN_GRACE_PERIOD
         )
@@ -114,6 +119,7 @@ class Worker:
             if not self.once:
                 # --once drains and exits, no reason to wait for staleness.
                 loops.append(reaper_loop(self))
+                loops.append(scheduler_loop(self))
             await asyncio.gather(*loops)
         finally:
             # wait=False: _drain_inflight already waited up to

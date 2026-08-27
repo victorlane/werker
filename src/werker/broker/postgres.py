@@ -14,7 +14,7 @@ from django.db.models.functions import Coalesce
 from django.utils import timezone
 
 from werker.broker import Broker, ClaimedItem, QueueItem, ReclaimedItem
-from werker.models import DBTaskResult, DeliveryGuarantee, TaskStatus
+from werker.models import DBTaskResult, DeliveryGuarantee, PeriodicTask, TaskStatus
 
 
 class PostgresBroker(Broker):
@@ -142,6 +142,26 @@ class PostgresBroker(Broker):
             )
             for row in rows
         ]
+
+    def claim_due_schedules(self, *, limit: int, worker_id: str) -> list[str]:
+        """Atomically claims due, enabled PeriodicTask rows and returns ids.
+        Rows stay locked until _dispatch's transaction commits (the lock is
+        held to the same transaction because we're inside one here too)."""
+        now = timezone.now()
+        with transaction.atomic():
+            ids = list(
+                PeriodicTask.objects.select_for_update(skip_locked=True)
+                .filter(enabled=True, next_run_at__lte=now)
+                .order_by("next_run_at")
+                .values_list("id", flat=True)[:limit]
+            )
+            if not ids:
+                return []
+            PeriodicTask.objects.filter(id__in=ids).update(
+                claimed_by=worker_id,
+                last_heartbeat_at=now,
+            )
+        return [str(i) for i in ids]
 
 
 def _reaper_error() -> dict[str, str]:
