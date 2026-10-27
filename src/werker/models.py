@@ -2,6 +2,8 @@ import uuid
 
 from django.db import models
 
+UNIQUE_ACTIVE_CONSTRAINT = "werker_unique_active"
+
 
 class TaskStatus(models.TextChoices):
     """Mirrors django.tasks.TaskResultStatus."""
@@ -67,12 +69,22 @@ class DBTaskResult(models.Model):
     #: Set by werker.api.cancel on a RUNNING task; the worker notices it on
     #: its next heartbeat.
     cancel_requested_at = models.DateTimeField(null=True, blank=True)
+    #: Set for @unique tasks. Only one READY or RUNNING row may hold a key.
+    #: NULL (not "") for other tasks, since the unique constraint ignores NULLs.
+    unique_key = models.CharField(max_length=255, null=True, blank=True)  # noqa: DJ001
 
     class Meta:
         indexes = [
             models.Index(
                 fields=["status", "queue_name", "-priority", "run_after"],
                 name="werker_claim_idx",
+            ),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["unique_key"],
+                condition=models.Q(status__in=["READY", "RUNNING"]),
+                name=UNIQUE_ACTIVE_CONSTRAINT,
             ),
         ]
 

@@ -22,6 +22,7 @@ class DBResultStore(ResultStore):
         enqueued_at: datetime,
         max_retries: int,
         delivery_guarantee: DeliveryGuarantee = DeliveryGuarantee.AT_LEAST_ONCE,
+        unique_key: str | None = None,
     ) -> None:
         DBTaskResult.objects.create(
             id=id,
@@ -35,6 +36,7 @@ class DBResultStore(ResultStore):
             enqueued_at=enqueued_at,
             max_retries=max_retries,
             delivery_guarantee=delivery_guarantee,
+            unique_key=unique_key,
         )
 
     def mark_running(self, id: str, *, worker_id: str, attempt: int) -> bool:

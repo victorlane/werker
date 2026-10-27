@@ -88,3 +88,32 @@ def timeout(seconds: float) -> TaskDecorator:
         return task
 
     return decorate
+
+
+def unique(
+    task: Task[..., Any] | None = None, *, key: Callable[..., Any] | None = None
+) -> Any:
+    """Prevents duplicate queued work: while a task with the same key is
+    READY or RUNNING (including waiting for a retry), enqueueing it again
+    returns the existing result instead of adding a row. Once it has
+    finished, it can be enqueued again.
+
+    The key defaults to the task's arguments. `key` receives the task's
+    arguments and returns the key to dedupe on:
+
+        @unique
+        @task
+        def rebuild_index(): ...
+
+        @unique(key=lambda user_id, **_: user_id)
+        @task
+        def sync_user(user_id, force=False): ...
+    """
+    if key is not None and not callable(key):
+        raise ImproperlyConfigured("unique(key=...) must be callable.")
+
+    def decorate(task: Task[..., Any]) -> Task[..., Any]:
+        registry.set_policy(task.module_path, unique=key or True)
+        return task
+
+    return decorate(task) if task is not None else decorate

@@ -15,10 +15,14 @@ them needs deferred annotation evaluation.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
+from collections.abc import Mapping, Sequence
 from typing import Any, cast
 
 from django.core.exceptions import ValidationError
+from django.db import IntegrityError, transaction
 from django.tasks.backends.base import BaseTaskBackend
 from django.tasks.base import Task, TaskError, TaskResult, TaskResultStatus
 from django.tasks.exceptions import TaskResultDoesNotExist
@@ -30,7 +34,7 @@ from typing_extensions import ParamSpec, TypeVar
 from werker import registry
 from werker.broker import QueueItem
 from werker.config import validate_options
-from werker.models import DBTaskResult, TaskStatus
+from werker.models import UNIQUE_ACTIVE_CONSTRAINT, DBTaskResult, TaskStatus
 from werker.schedules.registry import ScheduleDeclaration
 
 _P = ParamSpec("_P")
@@ -39,6 +43,7 @@ _R = TypeVar("_R")
 DEFAULT_BROKER_CLASS = "werker.broker.postgres.PostgresBroker"
 DEFAULT_RESULT_STORE_CLASS = "werker.results.db.DBResultStore"
 DEFAULT_MAX_RETRIES = 3
+UNIQUE_KEY_MAX_LENGTH = 255
 
 
 class PostgresTaskBackend(BaseTaskBackend):
@@ -69,7 +74,7 @@ class PostgresTaskBackend(BaseTaskBackend):
         isn't imported yet, since DBTaskResult stores task_path as a string."""
         now = timezone.now()
         result_id = str(uuid.uuid4())
-        self._write_enqueue(
+        result_id, _ = self._write_enqueue(
             QueueItem(
                 id=result_id,
                 queue_name=declaration.queue_name,
@@ -88,6 +93,9 @@ class PostgresTaskBackend(BaseTaskBackend):
                 "max_retries": self._max_retries_for(declaration.task_path),
                 "delivery_guarantee": registry.delivery_guarantee_for(
                     declaration.task_path
+                ),
+                "unique_key": unique_key_for(
+                    declaration.task_path, declaration.args, declaration.kwargs
                 ),
             },
         )
@@ -116,26 +124,51 @@ class PostgresTaskBackend(BaseTaskBackend):
             "enqueued_at": now,
             "max_retries": self._max_retries_for(task.module_path),
             "delivery_guarantee": registry.delivery_guarantee_for(task.module_path),
+            "unique_key": unique_key_for(task.module_path, args, kwargs),
         }
         return result_id, queue_item, create_kwargs
 
-    def _write_enqueue(self, queue_item: QueueItem, create_kwargs: dict[str, Any]) -> None:
+    def _write_enqueue(
+        self, queue_item: QueueItem, create_kwargs: dict[str, Any]
+    ) -> tuple[str, bool]:
         """create + enqueue in one transaction: a failed broker.enqueue must
-        not leave a READY row with nothing pointing at it."""
-        from django.db import transaction
+        not leave a READY row with nothing pointing at it.
 
-        with transaction.atomic():
-            self.result_store.create(**create_kwargs)
-            self.broker.enqueue(queue_item)
+        Returns (result id, created). For a @unique task that already has a
+        READY or RUNNING row with the same key, nothing is written and that
+        row's id is returned with created=False."""
+        unique_key = create_kwargs.get("unique_key")
+        # Twice: the conflicting row can finish between our failed insert
+        # and the lookup, which frees the key.
+        for _ in range(2):
+            try:
+                with transaction.atomic():
+                    self.result_store.create(**create_kwargs)
+                    self.broker.enqueue(queue_item)
+                return queue_item.id, True
+            except IntegrityError as exc:
+                if unique_key is None or UNIQUE_ACTIVE_CONSTRAINT not in str(exc):
+                    raise
+            existing = (
+                DBTaskResult.objects.filter(
+                    unique_key=unique_key, status__in=[TaskStatus.READY, TaskStatus.RUNNING]
+                )
+                .values_list("id", flat=True)
+                .first()
+            )
+            if existing is not None:
+                return str(existing), False
+        raise IntegrityError(f"could not enqueue unique task {unique_key!r}")
 
     def enqueue(
         self, task: Task[_P, _R], args: list[Any], kwargs: dict[str, Any]
     ) -> TaskResult[_P, _R]:
         result_id, queue_item, create_kwargs = self._enqueue_plan(task, args, kwargs)
-        self._write_enqueue(queue_item, create_kwargs)
+        result_id, created = self._write_enqueue(queue_item, create_kwargs)
 
         result = self.get_result(result_id)
-        task_enqueued.send(type(self), task_result=result)
+        if created:
+            task_enqueued.send(type(self), task_result=result)
         # get_result resolves Task generically, so its return type is
         # narrower than what we actually know here from `task`.
         return cast("TaskResult[_P, _R]", result)
@@ -146,12 +179,13 @@ class PostgresTaskBackend(BaseTaskBackend):
         result_id, queue_item, create_kwargs = self._enqueue_plan(task, args, kwargs)
         # Run the sync create+enqueue block on the ResultStore's dedicated
         # executor so both land in one transaction, same as enqueue().
-        await self.result_store._run_sync(
+        result_id, created = await self.result_store._run_sync(
             self._write_enqueue, queue_item, create_kwargs
         )
 
         result = await self.aget_result(result_id)
-        task_enqueued.send(type(self), task_result=result)
+        if created:
+            task_enqueued.send(type(self), task_result=result)
         return cast("TaskResult[_P, _R]", result)
 
     def get_result(self, result_id: str) -> TaskResult[..., Any]:
@@ -188,3 +222,19 @@ def _to_task_result(row: DBTaskResult, *, backend_alias: str) -> TaskResult[...,
     if row.status == TaskStatus.SUCCESSFUL:
         object.__setattr__(result, "_return_value", row.return_value)
     return result
+
+
+def unique_key_for(task_path: str, args: Sequence[Any], kwargs: Mapping[str, Any]) -> str | None:
+    """The dedupe key for a @unique task, or None. Default: a hash of the
+    arguments. A custom key function gets the task's arguments."""
+    unique = registry.policy_for(task_path).unique
+    if not unique:
+        return None
+    if callable(unique):
+        raw = str(unique(*args, **kwargs))
+    else:
+        raw = json.dumps([list(args), dict(kwargs)], sort_keys=True, default=str)
+    key = f"{task_path}:{raw}"
+    if callable(unique) and len(key) <= UNIQUE_KEY_MAX_LENGTH:
+        return key  # readable in the admin
+    return f"{task_path}:{hashlib.sha256(raw.encode()).hexdigest()}"[:UNIQUE_KEY_MAX_LENGTH]

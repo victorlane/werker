@@ -32,6 +32,8 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - LISTEN/NOTIFY wakeups: idle workers pick up a newly enqueued task at
   once instead of at the next poll (`LISTEN_NOTIFY`, `LISTEN_DATABASE`).
   A finished task also wakes the claim loop.
+- `@unique` decorator: enqueueing a task whose key is already READY or
+  RUNNING returns the existing result instead of adding a duplicate.
 - Worker presence: a `WorkerRecord` row per worker (listed in the admin),
   `taskworker --health-file`, and a `werker_health` command for liveness
   and readiness probes.

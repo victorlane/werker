@@ -14,14 +14,14 @@ import traceback
 
 from asgiref.sync import sync_to_async
 from django.core.exceptions import ValidationError
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.db.models import F
 from django.tasks.exceptions import TaskResultDoesNotExist
 from django.utils import timezone
 
 from werker.broker.postgres import notify_queue
 from werker.exceptions import TaskCancelled
-from werker.models import DBTaskResult, TaskStatus
+from werker.models import UNIQUE_ACTIVE_CONSTRAINT, DBTaskResult, TaskStatus
 
 
 def cancelled_error() -> dict[str, str]:
@@ -58,8 +58,9 @@ def cancel(result_id: str) -> bool:
 
 def requeue(result_id: str, *, reset_attempts: bool = True) -> bool:
     """Puts a FAILED task back in the queue to run now. Returns False for
-    any other status. Its error history is kept; `reset_attempts` gives it
-    a fresh retry budget."""
+    any other status, or for a @unique task whose key is already queued.
+    Its error history is kept; `reset_attempts` gives it a fresh retry
+    budget."""
     updates = {
         "status": TaskStatus.READY,
         "run_after": timezone.now(),
@@ -72,9 +73,16 @@ def requeue(result_id: str, *, reset_attempts: bool = True) -> bool:
     }
     with transaction.atomic():
         row = _locked_row(result_id)
-        updated = DBTaskResult.objects.filter(id=result_id, status=TaskStatus.FAILED).update(
-            **updates
-        )
+        try:
+            with transaction.atomic():
+                updated = DBTaskResult.objects.filter(
+                    id=result_id, status=TaskStatus.FAILED
+                ).update(**updates)
+        except IntegrityError as exc:
+            if UNIQUE_ACTIVE_CONSTRAINT not in str(exc):
+                raise
+            # A @unique task with the same key is already queued.
+            return False
         if updated:
             notify_queue(row.queue_name)
     return bool(updated)

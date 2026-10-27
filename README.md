@@ -198,6 +198,27 @@ def charge_customer(payment_id: str) -> None:
 
 An at-most-once task with a stale claim is failed rather than reclaimed. It can therefore be lost on a worker crash. The decorator must be outside `@task`.
 
+## Duplicate prevention
+
+`@unique` stops the same work from being queued twice. While a task with the same key is READY or RUNNING (including while it waits for a retry), enqueueing it again writes nothing and returns the existing result. Once that task has finished, it can be enqueued again.
+
+```python
+from django.tasks import task
+from werker.decorators import unique
+
+@unique  # key: the task's arguments
+@task
+def rebuild_search_index(section: str) -> None:
+    ...
+
+@unique(key=lambda user_id, **_: user_id)  # key: only user_id
+@task
+def sync_user(user_id: int, force: bool = False) -> None:
+    ...
+```
+
+A Postgres partial unique index enforces this, so it also holds for concurrent enqueues from different processes. The `task_enqueued` signal is only sent when a new row is created. A periodic task with `@unique` doesn't pile up when a run takes longer than its interval. `requeue` returns `False` for a failed `@unique` task whose key is already queued again.
+
 ## Timeouts
 
 Set a time limit for one task with `@timeout`, or for all tasks with the `TASK_TIMEOUT` option. An attempt that runs longer fails with `werker.exceptions.TaskTimeout` and is retried like any other failure:
