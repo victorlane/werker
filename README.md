@@ -217,6 +217,23 @@ With `catchup=False` (the default), fully missed occurrences are skipped and the
 
 Task rows contain arguments, results, recorded errors, lifecycle timestamps, claim ownership, and attempt history. Django admin registers task results as read-only and exposes periodic tasks for operational inspection. Treat both as sensitive operational data and restrict admin access accordingly.
 
+### Cancel and requeue
+
+```python
+from werker.api import cancel, requeue  # async: acancel, arequeue
+
+cancel(result.id)   # False if the task had already finished
+requeue(result.id)  # FAILED tasks only; False otherwise
+```
+
+Django's task API has no "cancelled" status, so a cancelled task becomes FAILED with a `werker.exceptions.TaskCancelled` error.
+
+- **READY** tasks are cancelled immediately and never run.
+- **RUNNING** tasks are cancelled at the worker's next heartbeat (`HEARTBEAT_INTERVAL`). An async task is interrupted. A sync task can't be interrupted: it runs to the end and keeps its result, but is never retried.
+- **Requeue** runs a FAILED task again now, with a fresh retry budget (`reset_attempts=False` keeps the old count). Its error history is kept.
+
+The task result admin has "Cancel selected tasks" and "Requeue selected failed tasks" actions.
+
 Prune old terminal results on a regular schedule. READY and RUNNING rows are never deleted by this command:
 
 ```bash

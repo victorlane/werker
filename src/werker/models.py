@@ -64,6 +64,9 @@ class DBTaskResult(models.Model):
     claimed_by = models.CharField(max_length=255, blank=True, default="")
     claimed_at = models.DateTimeField(null=True, blank=True)
     last_heartbeat_at = models.DateTimeField(null=True, blank=True)
+    #: Set by werker.api.cancel on a RUNNING task; the worker notices it on
+    #: its next heartbeat.
+    cancel_requested_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         indexes = [

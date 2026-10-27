@@ -14,6 +14,8 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Python 3.12+ is required (Django 6 does not support 3.11).
 
 ### Fixed
+- A failing heartbeat query no longer stops the task's heartbeats, which
+  let the reaper reclaim a task that was still running.
 - runserver autostart crashed at startup because signal handlers can't be
   installed off the main thread. It also only starts in the autoreloader's
   child process now, so runserver runs one worker instead of two.
@@ -27,6 +29,9 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `@retry` decorator: per-task retry budget, exception filter (`on=`) and
   backoff settings.
 - `RETRY_JITTER` option (default on) that randomises retry delays.
+- `werker.api.cancel` / `requeue` (and async `acancel` / `arequeue`), plus
+  matching admin actions. A cancelled task is FAILED with a
+  `werker.exceptions.TaskCancelled` error.
 - `@timeout` decorator and `TASK_TIMEOUT` option: an attempt that runs too
   long fails with `werker.exceptions.TaskTimeout`.
 - The reaper now delays a reclaimed task with the same exponential backoff

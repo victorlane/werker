@@ -129,11 +129,14 @@ class Broker(abc.ABC):
         )
 
     @abc.abstractmethod
-    def heartbeat(self, item_id: str, *, worker_id: str, attempt: int) -> None:
-        """Extends the claim's staleness window. See werker.worker.reaper."""
+    def heartbeat(self, item_id: str, *, worker_id: str, attempt: int) -> bool:
+        """Extends the claim's staleness window. See werker.worker.reaper.
+        Returns True if cancelling the task was requested (werker.api.cancel)."""
 
-    async def aheartbeat(self, item_id: str, *, worker_id: str, attempt: int) -> None:
-        await self._run_sync(self.heartbeat, item_id, worker_id=worker_id, attempt=attempt)
+    async def aheartbeat(self, item_id: str, *, worker_id: str, attempt: int) -> bool:
+        return await self._run_sync(
+            self.heartbeat, item_id, worker_id=worker_id, attempt=attempt
+        )
 
     @abc.abstractmethod
     def reclaim_stale(

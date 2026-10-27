@@ -96,12 +96,12 @@ class PostgresBroker(Broker):
             last_heartbeat_at=None,
         )
 
-    def heartbeat(self, item_id: str, *, worker_id: str, attempt: int) -> None:
-        DBTaskResult.objects.filter(
+    def heartbeat(self, item_id: str, *, worker_id: str, attempt: int) -> bool:
+        claim = DBTaskResult.objects.filter(
             id=item_id, status=TaskStatus.RUNNING, claimed_by=worker_id, attempts=attempt
-        ).update(
-            last_heartbeat_at=timezone.now()
         )
+        claim.update(last_heartbeat_at=timezone.now())
+        return claim.filter(cancel_requested_at__isnull=False).exists()
 
     def reclaim_stale(
         self, *, stale_before: datetime, limit: int, retry_delay: RetryDelay

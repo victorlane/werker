@@ -19,7 +19,7 @@ import signal
 import socket
 import traceback
 import uuid
-from collections.abc import Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine
 from datetime import timedelta
 from inspect import iscoroutinefunction
 from typing import Any
@@ -35,7 +35,7 @@ from werker import registry
 from werker.backend import PostgresTaskBackend
 from werker.broker import ClaimedItem, retries_remaining
 from werker.config import validate_options
-from werker.exceptions import TaskTimeout
+from werker.exceptions import TaskCancelled, TaskTimeout
 from werker.models import DeliveryGuarantee
 from werker.retry import backoff_delay
 from werker.worker.executor import create_executor, run_with_connection_cleanup
@@ -115,6 +115,8 @@ class Worker:
         self._inflight: set[asyncio.Task[None]] = set()
         # Sync task threads that timed out but haven't returned yet.
         self._abandoned = 0
+        # Ids of running tasks whose cancelling was requested.
+        self._cancel_requested: set[str] = set()
 
     async def run(self) -> None:
         self._install_signal_handlers()
@@ -276,22 +278,43 @@ class Worker:
             else tuple(result.args)
         )
 
-        heartbeat_sender = asyncio.ensure_future(self._heartbeat_sender(item))
         task_timeout = self._timeout_for(item.task_path)
-        try:
-            if iscoroutinefunction(task.func):
-                async with self._async_semaphore:
-                    raw_return_value = await self._call_async(
-                        item, task.func(*call_args, **result.kwargs), task_timeout
-                    )
-            else:
-                raw_return_value = await self._call_sync(
-                    item,
-                    functools.partial(
-                        run_with_connection_cleanup, task.func, *call_args, **result.kwargs
-                    ),
-                    task_timeout,
+        is_async = iscoroutinefunction(task.func)
+        if is_async:
+            execution = asyncio.ensure_future(
+                _outcome(
+                    self._call_async(item, task.func, call_args, result.kwargs, task_timeout)
                 )
+            )
+        else:
+            execution = asyncio.ensure_future(
+                _outcome(
+                    self._call_sync(
+                        item,
+                        functools.partial(
+                            run_with_connection_cleanup, task.func, *call_args, **result.kwargs
+                        ),
+                        task_timeout,
+                    )
+                )
+            )
+        # Only an async task can be interrupted when cancelling is requested.
+        heartbeat_sender = asyncio.ensure_future(
+            self._heartbeat_sender(item, execution if is_async else None)
+        )
+        try:
+            try:
+                succeeded, raw_return_value = await execution
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if item.id in self._cancel_requested and not (
+                    current and current.cancelling()
+                ):
+                    # The heartbeat sender cancelled it on request, not shutdown.
+                    raise TaskCancelled("cancelled while running") from None
+                raise
+            if not succeeded:
+                raise raw_return_value
         except asyncio.CancelledError:
             # Shutdown abandoned this task; the reaper reclaims it.
             raise
@@ -322,6 +345,7 @@ class Worker:
             heartbeat_sender.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await heartbeat_sender
+            self._cancel_requested.discard(item.id)
 
         finished_result = await self.backend.aget_result(item.id)
         task_finished.send(sender=type(self.backend), task_result=finished_result)
@@ -331,13 +355,18 @@ class Worker:
         return policy_timeout if policy_timeout is not None else self.task_timeout
 
     async def _call_async(
-        self, item: ClaimedItem, coro: Coroutine[Any, Any, Any], task_timeout: float | None
+        self,
+        item: ClaimedItem,
+        func: Callable[..., Coroutine[Any, Any, Any]],
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        task_timeout: float | None,
     ) -> Any:
         """Awaits an async task, cancelling it cleanly past its timeout."""
         deadline = asyncio.timeout(task_timeout)
         try:
-            async with deadline:
-                return await coro
+            async with self._async_semaphore, deadline:
+                return await func(*args, **kwargs)
         except TimeoutError as exc:
             if deadline.expired():
                 raise TaskTimeout(f"{item.task_path} exceeded {task_timeout}s") from exc
@@ -380,14 +409,28 @@ class Worker:
         with contextlib.suppress(RuntimeError):
             loop.call_soon_threadsafe(callback)
 
-    async def _heartbeat_sender(self, item: ClaimedItem) -> None:
-        """Keeps this exact claim attempt's heartbeat fresh. Cancelled as soon
-        as execution finishes, see _run_claimed's finally block."""
+    async def _heartbeat_sender(
+        self, item: ClaimedItem, interruptible: "asyncio.Future[Any] | None"
+    ) -> None:
+        """Keeps this exact claim attempt's heartbeat fresh, and notices a
+        cancel request (werker.api.cancel). Cancelled as soon as execution
+        finishes, see _run_claimed's finally block."""
         while True:
             await asyncio.sleep(self.heartbeat_interval)
-            await self.backend.broker.aheartbeat(
-                item.id, worker_id=self.worker_id, attempt=item.attempt
-            )
+            try:
+                cancel_requested = await self.backend.broker.aheartbeat(
+                    item.id, worker_id=self.worker_id, attempt=item.attempt
+                )
+            except Exception:
+                # Keep trying: a dead heartbeat sender would let the reaper
+                # reclaim a task that is still running.
+                logger.exception("werker worker %s heartbeat failed", self.worker_id)
+                continue
+            if cancel_requested and item.id not in self._cancel_requested:
+                logger.info("werker worker %s cancelling task %s", self.worker_id, item.id)
+                self._cancel_requested.add(item.id)
+                if interruptible is not None:
+                    interruptible.cancel()
 
     async def _handle_failure(self, item: ClaimedItem, exc: BaseException) -> None:
         exception_type = type(exc)
@@ -398,6 +441,8 @@ class Worker:
         policy = registry.policy_for(item.task_path)
         will_retry = retries_remaining(item.attempt, item.max_retries)
         if policy.retry_on is not None and not isinstance(exc, policy.retry_on):
+            will_retry = False
+        if item.id in self._cancel_requested:
             will_retry = False
         if (
             isinstance(exc, TaskTimeout)
@@ -426,3 +471,15 @@ class Worker:
             await self.backend.broker.aack(
                 item.id, worker_id=self.worker_id, attempt=item.attempt
             )
+
+
+async def _outcome(awaitable: Awaitable[Any]) -> tuple[bool, Any]:
+    """(True, value) or (False, exception). asyncio re-raises SystemExit and
+    KeyboardInterrupt out of the event loop when they leave a Task, so task
+    code raising them must be caught inside the Task that runs it."""
+    try:
+        return True, await awaitable
+    except asyncio.CancelledError:
+        raise
+    except BaseException as exc:
+        return False, exc
