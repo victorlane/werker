@@ -1,17 +1,21 @@
-# werker
+# Werker
 
-Self-contained, Postgres-backed background tasks for Django's native `django.tasks` framework. No Redis, no separate broker or infra, just your existing database.
+Werker is a self-contained, PostgreSQL-backed task queue and periodic scheduler for Django's native `django.tasks` framework. It stores queued work and results in your Django database: no Redis and no separate broker service. **PostgreSQL is required**; queue claims rely on `SELECT ... FOR UPDATE SKIP LOCKED`.
 
-## Quickstart
+> **Status:** `0.1.0.dev0` is an early development preview. Review its delivery guarantees and run it against a supported PostgreSQL deployment before using it for critical work.
+
+## Install and configure
+
+Werker requires Python 3.11+, Django 6.0+, and PostgreSQL. Install it and add the application plus Django task backend configuration:
 
 ```bash
-pip install werker
+python -m pip install werker
 ```
 
 ```python
 # settings.py
 INSTALLED_APPS = [
-    ...
+    # ...
     "werker",
 ]
 
@@ -23,12 +27,18 @@ TASKS = {
 }
 ```
 
+Apply the migrations, then run a worker as a separately supervised process in production:
+
 ```bash
 python manage.py migrate
 python manage.py taskworker
 ```
 
-## Example
+The worker's database role needs normal read/write access to Werker's tables. Do not put secrets in task arguments, return values, or exception messages: they are persisted in PostgreSQL.
+
+## Enqueue and inspect work
+
+Use Django's `@task` API normally. Task modules are discovered from installed apps during startup, but explicitly importing tasks in code remains fine.
 
 ```python
 # myapp/tasks.py
@@ -36,25 +46,22 @@ from django.tasks import task
 
 @task
 def send_welcome_email(user_id: int) -> str:
-    ...
+    # Send the message...
     return "sent"
 ```
 
 ```python
-# somewhere else
 from myapp.tasks import send_welcome_email
 
 result = send_welcome_email.enqueue(user_id=42)
-result.id       # track it
-result.status   # READY, RUNNING, SUCCESSFUL, or FAILED
+print(result.id, result.status)  # READY, RUNNING, SUCCESSFUL, or FAILED
 
-# or from an async view
+# From async code:
 result = await send_welcome_email.aenqueue(user_id=42)
 await result.arefresh()
-result.return_value
 ```
 
-Waiting synchronously for a result to finish:
+`TaskResult` exposes Django's normal timestamps, errors, status, and, after a successful refresh, `return_value`. To wait without a blocking worker API, poll with a timeout appropriate to the request or job:
 
 ```python
 import time
@@ -63,50 +70,137 @@ result = send_welcome_email.enqueue(user_id=42)
 while not result.is_finished:
     time.sleep(0.5)
     result.refresh()
-result.return_value
+print(result.return_value)
 ```
 
-## Scheduling
+Avoid waiting inside web requests for long-running work; return the result ID and inspect it asynchronously instead.
+
+## Worker operation
+
+```text
+python manage.py taskworker [--backend ALIAS] [--queues first,second] [--once]
+```
+
+- `--backend` selects the `TASKS` alias (default: `default`).
+- `--queues` restricts claims to comma-separated queues; by default the backend's configured queues are used.
+- `--once` drains work that is due *at invocation time* and exits. It does not run periodic scheduling or stale-claim recovery; use it for checks, not a long-running deployment.
+
+Run at least one continuously running `taskworker` process. Multiple workers may share queues and schedules safely; PostgreSQL row locking prevents two workers from claiming the same ready task. Use your service manager (systemd, Kubernetes, etc.) to restart workers after failure and deploy schedule changes with `syncschedules` (below).
+
+During `python manage.py runserver`, a daemon worker starts automatically for local development. Set `WERKER_AUTOSTART = False` to disable it. This is not a production process-management strategy.
+
+### Worker `OPTIONS`
+
+Put options under `TASKS[alias]["OPTIONS"]`. All numeric options are validated when the backend/worker starts; positive values must be greater than zero, except the explicitly non-negative values below.
+
+| Option | Default | Meaning |
+| --- | ---: | --- |
+| `CONCURRENCY` | `8` | Maximum synchronous `def` task executions, backed by a thread pool. |
+| `MAX_ASYNC_CONCURRENCY` | `200` | Maximum native `async def` task executions. |
+| `CLAIM_BATCH_SIZE` | `10` | Maximum rows claimed in one queue, reaper, or scheduler operation. |
+| `POLL_INTERVAL` | `1.0` seconds | Delay before polling for more ready work. |
+| `MAX_RETRIES` | `3` | Retry budget written to each newly enqueued task. See retry semantics below. `0` disables retries. |
+| `RETRY_BACKOFF_BASE` | `2.0` seconds | Exponential retry base: an attempt numbered `n` waits `base ** n`. |
+| `RETRY_BACKOFF_MAX` | `300` seconds | Maximum failure retry delay. |
+| `HEARTBEAT_INTERVAL` | `15` seconds | How often a running task renews its lease. |
+| `STALE_RUNNING_TIMEOUT` | `300` seconds | A RUNNING task with an older heartbeat can be reclaimed. |
+| `REAPER_POLL_INTERVAL` | `30` seconds | Stale-claim recovery polling interval. |
+| `SCHEDULER_POLL_INTERVAL` | `30` seconds | Periodic-schedule polling interval. |
+| `SHUTDOWN_GRACE_PERIOD` | `30` seconds | Time to drain in-flight work after `SIGTERM`/`SIGINT`; `0` is allowed. |
+| `BOOKKEEPING_CONCURRENCY` | `4` | Dedicated thread-pool size for broker/result-store database bookkeeping. |
+| `STALE_SCHEDULE_CLAIM_TIMEOUT` | `STALE_RUNNING_TIMEOUT` | Positive scheduler dispatch-lease staleness timeout. This option is consumed by the PostgreSQL broker. |
+| `BROKER_CLASS` | `werker.broker.postgres.PostgresBroker` | Dotted custom broker class path. |
+| `RESULT_STORE_CLASS` | `werker.results.db.DBResultStore` | Dotted custom result-store class path. |
+
+For example:
 
 ```python
-# myapp/tasks.py
+TASKS = {"default": {"BACKEND": "werker.backend.PostgresTaskBackend", "OPTIONS": {
+    "CONCURRENCY": 16,
+    "MAX_RETRIES": 5,
+    "RETRY_BACKOFF_BASE": 2,
+    "RETRY_BACKOFF_MAX": 600,
+    "STALE_RUNNING_TIMEOUT": 600,
+}}}
+```
+
+## Retries and delivery guarantees
+
+An exception from a task is recorded (including its traceback). While retry budget remains, the task becomes READY again with an exponential delay; after the budget is exhausted, it is FAILED. A worker that crashes or is unable to finish before its heartbeat becomes stale is handled by the reaper similarly.
+
+The default is **at-least-once** delivery. A stale task with retries remaining may execute again, so task functions must be idempotent: use durable idempotency keys, unique constraints, transactional outboxes, or provider-side deduplication for externally visible effects. Werker does **not** provide exactly-once execution.
+
+For an operation where avoiding duplicates is more important than eventual execution, opt into **at-most-once** delivery:
+
+```python
+from django.tasks import task
+from werker.decorators import at_most_once
+
+@at_most_once
+@task
+def charge_customer(payment_id: str) -> None:
+    ...
+```
+
+An at-most-once task with a stale claim is failed rather than reclaimed. It can therefore be lost on a worker crash. The decorator must be outside `@task`.
+
+## Periodic schedules
+
+Wrap a Django `Task` with `@schedule`, outside `@task`. A declaration is copied to the database by `syncschedules`, then every running worker participates in dispatching due schedules.
+
+```python
 from datetime import timedelta
 from django.tasks import task
 from werker.schedules.decorators import schedule
 
-@schedule(every=timedelta(hours=1))      # or cron="0 3 * * *" + timezone="..."
+@schedule(every=timedelta(hours=1), name="reports.hourly")
 @task
-def nightly_report() -> str:
+def hourly_report() -> None:
+    ...
+
+@schedule(cron="0 3 * * *", timezone="Europe/Amsterdam", catchup=True)
+@task
+def nightly_report() -> None:
     ...
 ```
 
-Sync declarations into the DB (run after deploy / whenever `@schedule`
-decorators change), then the running worker's scheduler loop fires them:
+`every` accepts a positive `timedelta` or a whole number of seconds. `cron` accepts a croniter-valid five-part expression. `timezone` must be an IANA zone name and defaults to `UTC`. `name` defaults to the task's module path and must be unique across schedules. Scheduled invocations use the task's queue and priority.
+
+After every deploy that adds, changes, or removes `@schedule` declarations:
 
 ```bash
-python manage.py syncschedules
-python manage.py taskworker
+python manage.py syncschedules --all
 ```
 
-- `every` accepts a `timedelta` or whole seconds; `cron` validates with croniter.
-- `catchup=False` (default) skips missed runs; `catchup=True` fires once
-  immediately if the worker was down past a fire time.
-- scheduler poll interval, worker capacity etc. are OPTIONS (e.g.
-  `SCHEDULER_POLL_INTERVAL`).
+`--all` imports `<app>.tasks` for installed apps before synchronization. Synchronization is idempotent: it creates/updates declared rows, re-enables returned declarations, and disables rows for declarations that disappeared. It does not delete historical rows. A normal `taskworker` is required to fire due schedules; `taskworker --once` intentionally does not run the scheduler.
 
-## In-process worker (dev)
+With `catchup=False` (the default), fully missed occurrences are skipped and the next future occurrence is used. With `catchup=True`, one overdue occurrence is enqueued after recovery; it does not backfill every missed interval.
 
-During `python manage.py runserver`, Werker starts a background worker
-thread automatically (set `WERKER_AUTOSTART = False` to disable). For
-production, run `manage.py taskworker` as a separate process.
+## Results, admin, and retention
 
-## Pruning results
+Task rows contain arguments, results, recorded errors, lifecycle timestamps, claim ownership, and attempt history. Django admin registers task results as read-only and exposes periodic tasks for operational inspection. Treat both as sensitive operational data and restrict admin access accordingly.
 
-Bound table growth by deleting old terminal rows (never touches READY or
-RUNNING):
+Prune old terminal results on a regular schedule. READY and RUNNING rows are never deleted by this command:
 
 ```bash
-python manage.py prune_task_results --older-than=30d      # default
-python manage.py prune_task_results --dry-run             # preview
-python manage.py prune_task_results --status successful   # only one status
+python manage.py prune_task_results --older-than=30d      # default retention
+python manage.py prune_task_results --dry-run             # preview count
+python manage.py prune_task_results --status successful   # successful or failed
+python manage.py prune_task_results --batch-size 1000
 ```
+
+Durations support `d`, `h`, `m`, `s`, or bare hours (`30d`, `12h`, `90m`, `60s`, `72`). Run pruning from a scheduled system job and choose retention to meet your audit, privacy, and capacity requirements.
+
+## Observability and troubleshooting
+
+The `werker.worker` logger records worker lifecycle, stale-claim reclamation, schedule dispatches, and scheduler exceptions. Send it to your normal structured logging/alerting pipeline. Monitor worker availability, queue age, READY/RUNNING counts, FAILED counts, retries, stale reclaims, scheduler dispatch failures, and database connection saturation.
+
+If work is not running, check: migrations are applied; a `taskworker` is alive; the selected backend alias and queues match the task; `run_after` is due; and workers can reach PostgreSQL. If scheduled work is absent, run `syncschedules --all` after verifying task-module imports and inspect the corresponding `PeriodicTask` row in admin. Do not manually change claim fields while a worker is running; restart workers or allow stale leases to recover.
+
+## Development
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup and checks. Security reporting and data-handling guidance are in [SECURITY.md](SECURITY.md). Changes are tracked in [CHANGELOG.md](CHANGELOG.md).
+
+## License
+
+Werker is released under the [MIT License](LICENSE).

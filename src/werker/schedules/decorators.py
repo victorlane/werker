@@ -73,6 +73,8 @@ def schedule(
     else:  # pragma: no cover - guarded above, kept for mypy narrowing
         raise TypeError("schedule() requires one of 'every' or 'cron'.")
 
+    _validate_timezone(timezone)
+
     def decorator(t: Task[..., Any]) -> Task[..., Any]:
         register(
             ScheduleDeclaration(

@@ -1,6 +1,7 @@
 from datetime import datetime
 from typing import Any
 
+from django.db import transaction
 from django.utils import timezone
 
 from werker.models import DBTaskResult, DeliveryGuarantee, TaskStatus
@@ -36,26 +37,56 @@ class DBResultStore(ResultStore):
             delivery_guarantee=delivery_guarantee,
         )
 
-    def mark_running(self, id: str, *, worker_id: str, attempt: int) -> None:
-        result = DBTaskResult.objects.get(id=id)
-        result.worker_ids.append(worker_id)
-        DBTaskResult.objects.filter(id=id).update(worker_ids=result.worker_ids)
+    def mark_running(self, id: str, *, worker_id: str, attempt: int) -> bool:
+        """Record a worker only while it still owns this exact claim attempt."""
+        with transaction.atomic():
+            result = DBTaskResult.objects.select_for_update().filter(id=id).first()
+            if (
+                result is None
+                or result.status != TaskStatus.RUNNING
+                or result.claimed_by != worker_id
+                or result.attempts != attempt
+            ):
+                return False
+            # The row lock makes this read-modify-write safe across workers.
+            result.worker_ids = [*result.worker_ids, worker_id]
+            result.save(update_fields=["worker_ids"])
+        return True
 
-    def mark_successful(self, id: str, *, return_value: Any) -> None:
-        DBTaskResult.objects.filter(id=id).update(
+    def mark_successful(
+        self, id: str, *, worker_id: str, attempt: int, return_value: Any
+    ) -> bool:
+        updated = DBTaskResult.objects.filter(
+            id=id, status=TaskStatus.RUNNING, claimed_by=worker_id, attempts=attempt
+        ).update(
             status=TaskStatus.SUCCESSFUL,
             return_value=return_value,
             finished_at=timezone.now(),
         )
+        return bool(updated)
 
-    def mark_failed(self, id: str, *, error: dict[str, str], will_retry: bool) -> None:
-        result = DBTaskResult.objects.get(id=id)
-        result.errors.append(error)
-        update_fields: dict[str, Any] = {"errors": result.errors}
-        if not will_retry:
-            update_fields["status"] = TaskStatus.FAILED
-            update_fields["finished_at"] = timezone.now()
-        DBTaskResult.objects.filter(id=id).update(**update_fields)
+    def mark_failed(
+        self, id: str, *, worker_id: str, attempt: int, error: dict[str, str], will_retry: bool
+    ) -> bool:
+        # Locking prevents concurrent failures (including the stale-claim reaper)
+        # from overwriting each other's JSON error history.
+        with transaction.atomic():
+            result = DBTaskResult.objects.select_for_update().filter(id=id).first()
+            if (
+                result is None
+                or result.status != TaskStatus.RUNNING
+                or result.claimed_by != worker_id
+                or result.attempts != attempt
+            ):
+                return False
+            result.errors = [*result.errors, error]
+            update_fields = ["errors"]
+            if not will_retry:
+                result.status = TaskStatus.FAILED
+                result.finished_at = timezone.now()
+                update_fields.extend(["status", "finished_at"])
+            result.save(update_fields=update_fields)
+        return True
 
     def get(self, id: str) -> DBTaskResult:
         return DBTaskResult.objects.get(id=id)

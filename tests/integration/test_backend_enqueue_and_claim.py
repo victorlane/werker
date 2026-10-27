@@ -27,8 +27,10 @@ def test_enqueue_claim_execute_refresh_round_trip():
 
     backend.result_store.mark_running(result.id, worker_id="test-worker", attempt=1)
     return_value = say_hello.func("world")
-    backend.result_store.mark_successful(result.id, return_value=return_value)
-    backend.broker.ack(result.id)
+    backend.result_store.mark_successful(
+        result.id, worker_id="test-worker", attempt=1, return_value=return_value
+    )
+    backend.broker.ack(result.id, worker_id="test-worker", attempt=1)
 
     result.refresh()
     assert result.status == TaskResultStatus.SUCCESSFUL

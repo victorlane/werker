@@ -78,6 +78,8 @@ async def test_result_store_amark_successful_runs_concurrently_across_multiple_t
                     status=TaskStatus.RUNNING,
                     run_after=now,
                     enqueued_at=now,
+                    claimed_by="worker",
+                    attempts=1,
                 )
                 for _ in range(CONCURRENT_CALLS)
             ]
@@ -98,7 +100,12 @@ async def test_result_store_amark_successful_runs_concurrently_across_multiple_t
     store.mark_successful = instrumented_mark_successful
 
     await asyncio.gather(
-        *[store.amark_successful(str(row.id), return_value="ok") for row in rows]
+        *[
+            store.amark_successful(
+                str(row.id), worker_id="worker", attempt=1, return_value="ok"
+            )
+            for row in rows
+        ]
     )
 
     assert len(seen_thread_ids) > 1, (

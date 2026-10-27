@@ -31,6 +31,7 @@ from django.utils.json import normalize_json
 
 from werker.backend import PostgresTaskBackend
 from werker.broker import ClaimedItem
+from werker.config import validate_options
 from werker.worker.executor import create_executor, run_with_connection_cleanup
 from werker.worker.reaper import reaper_loop
 from werker.worker.scheduler import scheduler_loop
@@ -72,6 +73,7 @@ class Worker:
         self.worker_id = make_worker_id()
 
         options = self.backend.options
+        validate_options(options)
         self.concurrency: int = options.get("CONCURRENCY", DEFAULT_CONCURRENCY)
         self.max_async_concurrency: int = options.get(
             "MAX_ASYNC_CONCURRENCY", DEFAULT_MAX_ASYNC_CONCURRENCY
@@ -196,9 +198,17 @@ class Worker:
         result = await self.backend.aget_result(item.id)
         task = result.task
 
-        await self.backend.result_store.amark_running(
+        owns_claim = await self.backend.result_store.amark_running(
             item.id, worker_id=self.worker_id, attempt=item.attempt
         )
+        if not owns_claim:
+            logger.info(
+                "worker %s no longer owns task %s attempt %s",
+                self.worker_id,
+                item.id,
+                item.attempt,
+            )
+            return
         task_started.send(sender=type(self.backend), task_result=result)
 
         call_args = (
@@ -207,7 +217,7 @@ class Worker:
             else tuple(result.args)
         )
 
-        heartbeat_sender = asyncio.ensure_future(self._heartbeat_sender(item.id))
+        heartbeat_sender = asyncio.ensure_future(self._heartbeat_sender(item))
         try:
             if iscoroutinefunction(task.func):
                 async with self._async_semaphore:
@@ -225,10 +235,23 @@ class Worker:
             # not a worker bug.
             await self._handle_failure(item, exc)
         else:
-            await self.backend.result_store.amark_successful(
-                item.id, return_value=normalize_json(raw_return_value)
+            owns_claim = await self.backend.result_store.amark_successful(
+                item.id,
+                worker_id=self.worker_id,
+                attempt=item.attempt,
+                return_value=normalize_json(raw_return_value),
             )
-            await self.backend.broker.aack(item.id)
+            if not owns_claim:
+                logger.info(
+                    "worker %s no longer owns task %s attempt %s",
+                    self.worker_id,
+                    item.id,
+                    item.attempt,
+                )
+                return
+            await self.backend.broker.aack(
+                item.id, worker_id=self.worker_id, attempt=item.attempt
+            )
         finally:
             heartbeat_sender.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -237,12 +260,14 @@ class Worker:
         finished_result = await self.backend.aget_result(item.id)
         task_finished.send(sender=type(self.backend), task_result=finished_result)
 
-    async def _heartbeat_sender(self, item_id: str) -> None:
-        """Keeps last_heartbeat_at fresh while item_id runs. Cancelled as soon
+    async def _heartbeat_sender(self, item: ClaimedItem) -> None:
+        """Keeps this exact claim attempt's heartbeat fresh. Cancelled as soon
         as execution finishes, see _execute's finally block."""
         while True:
             await asyncio.sleep(self.heartbeat_interval)
-            await self.backend.broker.aheartbeat(item_id, worker_id=self.worker_id)
+            await self.backend.broker.aheartbeat(
+                item.id, worker_id=self.worker_id, attempt=item.attempt
+            )
 
     async def _handle_failure(self, item: ClaimedItem, exc: BaseException) -> None:
         exception_type = type(exc)
@@ -251,7 +276,15 @@ class Worker:
             "traceback": "".join(traceback.format_exception(exc)),
         }
         will_retry = item.attempt < self.max_retries
-        await self.backend.result_store.amark_failed(item.id, error=error, will_retry=will_retry)
+        owns_claim = await self.backend.result_store.amark_failed(
+            item.id,
+            worker_id=self.worker_id,
+            attempt=item.attempt,
+            error=error,
+            will_retry=will_retry,
+        )
+        if not owns_claim:
+            return
 
         if will_retry:
             delay = min(
@@ -259,6 +292,10 @@ class Worker:
                 self.retry_backoff_max,
             )
             retry_after = timezone.now() + timedelta(seconds=delay)
-            await self.backend.broker.anack(item.id, retry_after=retry_after)
+            await self.backend.broker.anack(
+                item.id, worker_id=self.worker_id, attempt=item.attempt, retry_after=retry_after
+            )
         else:
-            await self.backend.broker.aack(item.id)
+            await self.backend.broker.aack(
+                item.id, worker_id=self.worker_id, attempt=item.attempt
+            )

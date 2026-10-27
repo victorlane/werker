@@ -4,8 +4,9 @@ just a @task run with job-level retry, claim, and result tracking.
 
 Due rows are locked with SELECT ... FOR UPDATE SKIP LOCKED (consistent
 with werker.broker's claim semantics) so many workers can share the
-dispatch duty without double-firing, and a dispatch that crashes leaves
-the row claimed so it can be recovered rather than fired twice.
+  dispatch duty without double-firing.  Claims are ownership tokens rather
+  than locks held across threads; a crashed dispatcher leaves a token which
+  the broker recovers after its heartbeat becomes stale.
 """
 
 import asyncio
@@ -62,12 +63,21 @@ async def _dispatch(worker: "Worker", schedule_id: str) -> None:
 
 def _dispatch_sync(worker: "Worker", schedule_id: str) -> None:
     with transaction.atomic():
-        try:
-            task = PeriodicTask.objects.select_for_update().get(id=schedule_id, enabled=True)
-        except PeriodicTask.DoesNotExist:
-            return  # deleted or disabled between claim and dispatch.
-
         now = timezone.now()
+        try:
+            # The scheduler claim is a lease, not merely an advisory marker.
+            # Re-check both ownership and due-ness while holding the row lock:
+            # a stale claimant must not fire after another worker has recovered
+            # its lease, and an old queued id must not fire a schedule already
+            # advanced by a prior dispatch.
+            task = PeriodicTask.objects.select_for_update().get(
+                id=schedule_id,
+                enabled=True,
+                claimed_by=worker.worker_id,
+                next_run_at__lte=now,
+            )
+        except PeriodicTask.DoesNotExist:
+            return  # Disabled, no longer due, or this worker no longer owns it.
 
         # catchup=False -> skip any fully-missed occurrences: advance past
         # them and keep only a future next_run_at. A task that is merely
@@ -81,7 +91,9 @@ def _dispatch_sync(worker: "Worker", schedule_id: str) -> None:
                 if candidate <= task.next_run_at:
                     break  # degenerate schedule; avoid spinning forever
             task.next_run_at = candidate
-            task.save(update_fields=["next_run_at"])
+            task.claimed_by = ""
+            task.last_heartbeat_at = None
+            task.save(update_fields=["next_run_at", "claimed_by", "last_heartbeat_at"])
             return
 
         # Fire it: enqueue a normal DBTaskResult, then advance the

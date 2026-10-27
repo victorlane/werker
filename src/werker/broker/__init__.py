@@ -29,6 +29,7 @@ from werker.concurrency import (
     get_option,
     run_with_connection_cleanup,
 )
+from werker.config import validate_options
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
@@ -60,6 +61,7 @@ class Broker(abc.ABC):
     supports_skip_locked: ClassVar[bool] = True
 
     def __init__(self, options: Any):
+        validate_options(options)
         self.options = options
         concurrency = get_option(
             options, "BOOKKEEPING_CONCURRENCY", DEFAULT_BOOKKEEPING_CONCURRENCY
@@ -93,26 +95,30 @@ class Broker(abc.ABC):
         )
 
     @abc.abstractmethod
-    def ack(self, item_id: str) -> None:
+    def ack(self, item_id: str, *, worker_id: str, attempt: int) -> None:
         """Release claim ownership of a finished item. Doesn't touch terminal
         status, that's ResultStore's job."""
 
-    async def aack(self, item_id: str) -> None:
-        await self._run_sync(self.ack, item_id)
+    async def aack(self, item_id: str, *, worker_id: str, attempt: int) -> None:
+        await self._run_sync(self.ack, item_id, worker_id=worker_id, attempt=attempt)
 
     @abc.abstractmethod
-    def nack(self, item_id: str, *, retry_after: datetime) -> None:
+    def nack(self, item_id: str, *, worker_id: str, attempt: int, retry_after: datetime) -> None:
         """Release an item back to the queue, eligible for re-claim at retry_after."""
 
-    async def anack(self, item_id: str, *, retry_after: datetime) -> None:
-        await self._run_sync(self.nack, item_id, retry_after=retry_after)
+    async def anack(
+        self, item_id: str, *, worker_id: str, attempt: int, retry_after: datetime
+    ) -> None:
+        await self._run_sync(
+            self.nack, item_id, worker_id=worker_id, attempt=attempt, retry_after=retry_after
+        )
 
     @abc.abstractmethod
-    def heartbeat(self, item_id: str, *, worker_id: str) -> None:
+    def heartbeat(self, item_id: str, *, worker_id: str, attempt: int) -> None:
         """Extends the claim's staleness window. See werker.worker.reaper."""
 
-    async def aheartbeat(self, item_id: str, *, worker_id: str) -> None:
-        await self._run_sync(self.heartbeat, item_id, worker_id=worker_id)
+    async def aheartbeat(self, item_id: str, *, worker_id: str, attempt: int) -> None:
+        await self._run_sync(self.heartbeat, item_id, worker_id=worker_id, attempt=attempt)
 
     @abc.abstractmethod
     def reclaim_stale(
@@ -136,9 +142,9 @@ class Broker(abc.ABC):
     @abc.abstractmethod
     def claim_due_schedules(self, *, limit: int, worker_id: str) -> list[str]:
         """Atomically claims due, enabled PeriodicTask rows (SKIP LOCKED)
-        and returns their ids. Locks the rows so the scheduler's dispatch
-        step can decide catch-up and advance next_run_at without racing
-        another worker."""
+        and returns their ids. A claim persists as a lease between this call
+        and dispatch; a live lease excludes other schedulers, while a stale
+        one can be recovered by a later claim."""
 
     async def aclaim_due_schedules(self, *, limit: int, worker_id: str) -> list[str]:
         return await self._run_sync(

@@ -10,11 +10,10 @@ registers). The `--all` flag first imports `<app>.tasks` for every
 installed app to discover any schedules that haven't been loaded yet.
 """
 
-import contextlib
 from typing import Any
 from zoneinfo import ZoneInfoNotFoundError
 
-from django.core.management.base import BaseCommand, CommandParser
+from django.core.management.base import BaseCommand, CommandError, CommandParser
 
 from werker.models import PeriodicTask
 from werker.schedules.decorators import _validate_timezone
@@ -45,6 +44,12 @@ class Command(BaseCommand):
 
         declarations = get_declarations()
 
+        # Validate the complete desired state before looking up or modifying
+        # rows.  In particular, an invalid declaration later in the registry
+        # must not leave rows created for earlier declarations.
+        for declaration in declarations:
+            _validate_declaration(declaration)
+
         existing = {pt.name: pt for pt in PeriodicTask.objects.all()}
         live_names = {d.name for d in declarations}
 
@@ -65,8 +70,6 @@ class Command(BaseCommand):
 
         created = updated = reenabled = 0
         for declaration in declarations:
-            _validate_declaration(declaration)
-
             pt = existing.get(declaration.name)
             if pt is None:
                 _create_from(declaration)
@@ -97,8 +100,13 @@ class Command(BaseCommand):
 
 
 def _validate_declaration(declaration: ScheduleDeclaration) -> None:
-    with contextlib.suppress(ZoneInfoNotFoundError):
+    try:
         _validate_timezone(declaration.timezone)
+    except ZoneInfoNotFoundError as exc:
+        raise CommandError(
+            f"Schedule {declaration.name!r} has an unknown timezone "
+            f"{declaration.timezone!r}."
+        ) from exc
 
 
 def _create_from(declaration: ScheduleDeclaration) -> None:

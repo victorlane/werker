@@ -9,7 +9,7 @@ from collections.abc import Sequence
 from datetime import datetime, timedelta
 
 from django.db import transaction
-from django.db.models import F
+from django.db.models import F, Q
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 
@@ -63,13 +63,17 @@ class PostgresBroker(Broker):
             for row in rows
         ]
 
-    def ack(self, item_id: str) -> None:
-        DBTaskResult.objects.filter(id=item_id).update(
+    def ack(self, item_id: str, *, worker_id: str, attempt: int) -> None:
+        DBTaskResult.objects.filter(
+            id=item_id, claimed_by=worker_id, attempts=attempt
+        ).update(
             claimed_by="", claimed_at=None, last_heartbeat_at=None
         )
 
-    def nack(self, item_id: str, *, retry_after: datetime) -> None:
-        DBTaskResult.objects.filter(id=item_id).update(
+    def nack(self, item_id: str, *, worker_id: str, attempt: int, retry_after: datetime) -> None:
+        DBTaskResult.objects.filter(
+            id=item_id, status=TaskStatus.RUNNING, claimed_by=worker_id, attempts=attempt
+        ).update(
             status=TaskStatus.READY,
             run_after=retry_after,
             claimed_by="",
@@ -77,8 +81,10 @@ class PostgresBroker(Broker):
             last_heartbeat_at=None,
         )
 
-    def heartbeat(self, item_id: str, *, worker_id: str) -> None:
-        DBTaskResult.objects.filter(id=item_id, claimed_by=worker_id).update(
+    def heartbeat(self, item_id: str, *, worker_id: str, attempt: int) -> None:
+        DBTaskResult.objects.filter(
+            id=item_id, status=TaskStatus.RUNNING, claimed_by=worker_id, attempts=attempt
+        ).update(
             last_heartbeat_at=timezone.now()
         )
 
@@ -144,14 +150,32 @@ class PostgresBroker(Broker):
         ]
 
     def claim_due_schedules(self, *, limit: int, worker_id: str) -> list[str]:
-        """Atomically claims due, enabled PeriodicTask rows and returns ids.
-        Rows stay locked until _dispatch's transaction commits (the lock is
-        held to the same transaction because we're inside one here too)."""
+        """Atomically and exclusively claim due, enabled PeriodicTask rows.
+
+        A schedule claim is deliberately short-lived: it protects the gap
+        between selecting a due row and dispatching it in a separate worker
+        thread.  A crashed dispatcher leaves the row due, so a later poll may
+        take over only after its heartbeat is stale.  In particular, never
+        overwrite a live claim merely because the schedule remains due.
+        """
         now = timezone.now()
+        stale_before = now - timedelta(
+            seconds=float(
+                self.options.get(
+                    "STALE_SCHEDULE_CLAIM_TIMEOUT",
+                    self.options.get("STALE_RUNNING_TIMEOUT", 300),
+                )
+            )
+        )
         with transaction.atomic():
             ids = list(
                 PeriodicTask.objects.select_for_update(skip_locked=True)
                 .filter(enabled=True, next_run_at__lte=now)
+                .filter(
+                    Q(claimed_by="")
+                    | Q(last_heartbeat_at__isnull=True)
+                    | Q(last_heartbeat_at__lt=stale_before)
+                )
                 .order_by("next_run_at")
                 .values_list("id", flat=True)[:limit]
             )
