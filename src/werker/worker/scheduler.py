@@ -57,8 +57,9 @@ async def scheduler_loop(worker: "Worker") -> None:
 async def _dispatch(worker: "Worker", schedule_id: str) -> None:
     """Locks one due row, decides catch-up vs skip, fires it, and advances
     next_run_at."""
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(worker._executor, _dispatch_sync, worker, schedule_id)
+    # The broker's bookkeeping executor, not the sync-task pool: long-running
+    # tasks occupying every task thread must not stall scheduling.
+    await worker.backend.broker._run_sync(_dispatch_sync, worker, schedule_id)
 
 
 def _dispatch_sync(worker: "Worker", schedule_id: str) -> None:

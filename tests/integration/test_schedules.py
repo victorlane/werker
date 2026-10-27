@@ -8,6 +8,7 @@ The scheduled tasks are module-level (django.tasks refuses nested
 functions), so the declarations below register at import time.
 """
 
+import threading
 from datetime import timedelta
 
 import pytest
@@ -21,7 +22,7 @@ from werker.models import DBTaskResult, PeriodicTask, ScheduleKind, TaskStatus
 from werker.schedules.decorators import schedule
 from werker.schedules.registry import ScheduleDeclaration, clear, register
 from werker.worker.core import Worker
-from werker.worker.scheduler import _dispatch_sync
+from werker.worker.scheduler import _dispatch, _dispatch_sync
 
 
 @schedule(every=3600, name="integration-every-hour")
@@ -212,3 +213,15 @@ def test_syncschedules_validates_all_declarations_before_writing_any_rows():
     assert not PeriodicTask.objects.filter(
         name__in=["would-have-been-created", "invalid-timezone-after-valid-declaration"]
     ).exists()
+
+
+async def test_dispatch_does_not_compete_with_sync_tasks_for_threads(monkeypatch):
+    thread_names = []
+    monkeypatch.setattr(
+        "werker.worker.scheduler._dispatch_sync",
+        lambda worker, schedule_id: thread_names.append(threading.current_thread().name),
+    )
+
+    await _dispatch(Worker(), "any-id")
+
+    assert thread_names[0].startswith("werker-broker")
