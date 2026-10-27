@@ -121,3 +121,19 @@ class PeriodicTask(models.Model):
 
     def __str__(self) -> str:
         return self.name
+
+
+class WorkerRecord(models.Model):
+    """One row per worker process, kept fresh while it runs. Used for the
+    admin's worker list and `werker_health --db`."""
+
+    worker_id = models.CharField(max_length=255, primary_key=True)
+    hostname = models.CharField(max_length=255)
+    pid = models.PositiveIntegerField()
+    queues = models.JSONField(default=list)
+    started_at = models.DateTimeField()
+    last_seen_at = models.DateTimeField(db_index=True)
+    stopped_at = models.DateTimeField(null=True, blank=True)
+
+    def __str__(self) -> str:
+        return self.worker_id

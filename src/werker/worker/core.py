@@ -39,6 +39,7 @@ from werker.exceptions import TaskCancelled, TaskTimeout
 from werker.models import DeliveryGuarantee
 from werker.retry import backoff_delay
 from werker.worker.executor import create_executor, run_with_connection_cleanup
+from werker.worker.presence import presence_loop, save_presence, touch_health_file
 from werker.worker.reaper import reaper_loop
 from werker.worker.scheduler import scheduler_loop
 
@@ -63,7 +64,12 @@ def make_worker_id() -> str:
 
 class Worker:
     def __init__(
-        self, alias: str = "default", *, queues: list[str] | None = None, once: bool = False
+        self,
+        alias: str = "default",
+        *,
+        queues: list[str] | None = None,
+        once: bool = False,
+        health_file: str | None = None,
     ):
         self.alias = alias
         backend = task_backends[alias]
@@ -108,6 +114,7 @@ class Worker:
             "SHUTDOWN_GRACE_PERIOD", DEFAULT_SHUTDOWN_GRACE_PERIOD
         )
         self.task_timeout: float | None = options.get("TASK_TIMEOUT")
+        self.health_file: str | None = health_file or options.get("HEALTH_FILE")
 
         self._executor = create_executor(self.concurrency)
         self._async_semaphore = asyncio.Semaphore(self.max_async_concurrency)
@@ -126,14 +133,17 @@ class Worker:
             self.alias,
             self.queues,
         )
+        await save_presence(self)
         try:
             loops = [self._task_claim_loop()]
             if not self.once:
                 # --once drains and exits, no reason to wait for staleness.
                 loops.append(reaper_loop(self))
                 loops.append(scheduler_loop(self))
+                loops.append(presence_loop(self))
             await asyncio.gather(*loops)
         finally:
+            await save_presence(self, stopped=True)
             # wait=False: _drain_inflight already waited up to
             # shutdown_grace_period. A thread that ignored cancellation
             # can't be force-killed from here, don't block on it too.
@@ -178,6 +188,9 @@ class Worker:
 
     async def _task_claim_loop(self) -> None:
         while not self._shutdown.is_set():
+            # Touched on every pass, so a liveness probe on it also catches a
+            # stuck event loop, not only a dead process.
+            touch_health_file(self.health_file)
             capacity = self._available_capacity()
             if capacity <= 0:
                 await self._wait_or_shutdown(self.poll_interval)

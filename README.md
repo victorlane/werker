@@ -78,16 +78,40 @@ Avoid waiting inside web requests for long-running work; return the result ID an
 ## Worker operation
 
 ```text
-python manage.py taskworker [--backend ALIAS] [--queues first,second] [--once]
+python manage.py taskworker [--backend ALIAS] [--queues first,second] [--once] [--health-file PATH]
 ```
 
 - `--backend` selects the `TASKS` alias (default: `default`).
 - `--queues` restricts claims to comma-separated queues; by default the backend's configured queues are used.
+- `--health-file` touches a file on every pass of the worker loop, for liveness probes (see [Health checks](#health-checks)).
 - `--once` drains work that is due *at invocation time* and exits. It does not run periodic scheduling or stale-claim recovery; use it for checks, not a long-running deployment.
 
 Run at least one continuously running `taskworker` process. Multiple workers may share queues and schedules safely; PostgreSQL row locking prevents two workers from claiming the same ready task. Use your service manager (systemd, Kubernetes, etc.) to restart workers after failure and deploy schedule changes with `syncschedules` (below).
 
 During `python manage.py runserver`, a daemon worker starts automatically for local development. Set `WERKER_AUTOSTART = False` to disable it. This is not a production process-management strategy.
+
+### Health checks
+
+Every worker keeps a row in the `WorkerRecord` table, refreshed every `HEARTBEAT_INTERVAL` and marked stopped on a graceful shutdown. The admin lists workers with an "alive" column.
+
+`werker_health` exits 0 when healthy and 1 otherwise:
+
+```bash
+python manage.py werker_health --file /tmp/werker-alive --max-age 60  # no database query
+python manage.py werker_health --db [--hostname HOST] [--max-age SECONDS]
+```
+
+`--file` checks the file written by `taskworker --health-file`. Because the worker touches it on every loop pass, a stale file also means a stuck worker, not only a dead one. `--db` checks that at least one worker sent a heartbeat recently (default: within 3 × `HEARTBEAT_INTERVAL`).
+
+Kubernetes example:
+
+```yaml
+command: ["python", "manage.py", "taskworker", "--health-file", "/tmp/werker-alive"]
+livenessProbe:
+  exec:
+    command: ["python", "manage.py", "werker_health", "--file", "/tmp/werker-alive", "--max-age", "60"]
+  periodSeconds: 30
+```
 
 ### Worker `OPTIONS`
 
@@ -102,6 +126,7 @@ Put options under `TASKS[alias]["OPTIONS"]`. All numeric options are validated w
 | `MAX_RETRIES` | `3` | Retry budget written to each newly enqueued task. See retry semantics below. `0` disables retries. |
 | `RETRY_BACKOFF_BASE` | `2.0` seconds | Exponential retry base: an attempt numbered `n` waits `base ** n`. |
 | `RETRY_BACKOFF_MAX` | `300` seconds | Maximum failure retry delay. |
+| `HEALTH_FILE` | `None` | Path the worker touches on every loop pass. `taskworker --health-file` overrides it. |
 | `TASK_TIMEOUT` | `None` (no limit) | Seconds an attempt may run before it fails with `werker.exceptions.TaskTimeout`. See [Timeouts](#timeouts). |
 | `RETRY_JITTER` | `True` | Randomise each retry delay to between half and all of the computed delay, so tasks that failed together don't retry together. |
 | `HEARTBEAT_INTERVAL` | `15` seconds | How often a running task renews its lease. |

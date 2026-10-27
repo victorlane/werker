@@ -3,7 +3,8 @@ from django.db.models import QuerySet
 from django.http import HttpRequest
 
 from werker import api
-from werker.models import DBTaskResult, PeriodicTask
+from werker.models import DBTaskResult, PeriodicTask, WorkerRecord
+from werker.worker.presence import alive_cutoff
 
 
 @admin.register(DBTaskResult)
@@ -55,3 +56,18 @@ class PeriodicTaskAdmin(admin.ModelAdmin):  # type: ignore[type-arg]
     )
     list_filter = ("enabled", "schedule_kind")
     search_fields = ("name", "task_path")
+
+
+@admin.register(WorkerRecord)
+class WorkerRecordAdmin(admin.ModelAdmin):  # type: ignore[type-arg]
+    list_display = ("worker_id", "hostname", "pid", "alive", "started_at", "last_seen_at")
+    list_filter = ("hostname",)
+    search_fields = ("worker_id", "hostname")
+    readonly_fields = [f.name for f in WorkerRecord._meta.fields]
+
+    @admin.display(boolean=True)
+    def alive(self, obj: WorkerRecord) -> bool:
+        return obj.stopped_at is None and obj.last_seen_at >= alive_cutoff()
+
+    def has_add_permission(self, request: HttpRequest) -> bool:
+        return False

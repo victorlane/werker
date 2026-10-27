@@ -32,7 +32,21 @@ class Command(BaseCommand):
             ),
         )
 
+        parser.add_argument(
+            "--health-file",
+            default=None,
+            help=(
+                "Touch this file while the worker loop is healthy, for liveness "
+                "probes with `werker_health --file`. Overrides OPTIONS['HEALTH_FILE']."
+            ),
+        )
+
     def handle(self, *args: Any, **options: Any) -> None:
         queues = options["queues"].split(",") if options["queues"] else None
-        worker = Worker(alias=options["backend"], queues=queues, once=options["once"])
+        worker = Worker(
+            alias=options["backend"],
+            queues=queues,
+            once=options["once"],
+            health_file=options["health_file"],
+        )
         asyncio.run(worker.run())

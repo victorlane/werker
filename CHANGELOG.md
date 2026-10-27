@@ -29,6 +29,9 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `@retry` decorator: per-task retry budget, exception filter (`on=`) and
   backoff settings.
 - `RETRY_JITTER` option (default on) that randomises retry delays.
+- Worker presence: a `WorkerRecord` row per worker (listed in the admin),
+  `taskworker --health-file`, and a `werker_health` command for liveness
+  and readiness probes.
 - `werker.api.cancel` / `requeue` (and async `acancel` / `arequeue`), plus
   matching admin actions. A cancelled task is FAILED with a
   `werker.exceptions.TaskCancelled` error.
