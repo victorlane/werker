@@ -7,16 +7,39 @@ name = "werker"
 version = "0.1.0.dev0"
 description = "Self-contained Postgres-backed background tasks and scheduling for Django's native task framework."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 license = "MIT"
 authors = [{ name = "Victor Brinkhorst" }]
+keywords = ["django", "background-tasks", "postgresql", "scheduler", "task-queue"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Environment :: Web Environment",
+    "Framework :: Django",
+    "Framework :: Django :: 6.0",
+    "Framework :: Django :: 6.1",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
 dependencies = [
     "django>=6.0",
     "asgiref>=3.8",
     "croniter>=2.0",
+    "typing-extensions>=4.12",
 ]
 
+[project.urls]
+Documentation = "https://github.com/victorlane/werker#readme"
+Changelog = "https://github.com/victorlane/werker/blob/main/CHANGELOG.md"
+Issues = "https://github.com/victorlane/werker/issues"
+Source = "https://github.com/victorlane/werker"
+
 [project.optional-dependencies]
+postgres = ["psycopg[binary]>=3.2"]
 dev = [
     "pytest>=8.0",
     "pytest-django>=4.9",
@@ -27,14 +50,19 @@ dev = [
     "mypy>=1.13",
     "django-stubs[compatible-mypy]>=5.1",
     "psycopg[binary]>=3.2",
+    "build>=1.2",
+    "twine>=6.0",
 ]
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+werker = ["py.typed"]
+
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py312"
 extend-exclude = ["**/migrations/*.py"]
 
 [tool.ruff.lint]
@@ -64,3 +92,4 @@ DJANGO_SETTINGS_MODULE = "example.config.settings"
 python_files = ["test_*.py"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+pythonpath = ["."]
