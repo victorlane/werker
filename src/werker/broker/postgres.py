@@ -13,7 +13,14 @@ from django.db.models import F, Q
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 
-from werker.broker import Broker, ClaimedItem, QueueItem, ReclaimedItem, retries_remaining
+from werker.broker import (
+    Broker,
+    ClaimedItem,
+    QueueItem,
+    ReclaimedItem,
+    RetryDelay,
+    retries_remaining,
+)
 from werker.models import DBTaskResult, DeliveryGuarantee, PeriodicTask, TaskStatus
 
 
@@ -58,12 +65,13 @@ class PostgresBroker(Broker):
                 attempts=F("attempts") + 1,
             )
         rows = DBTaskResult.objects.filter(id__in=ids).values(
-            "id", "queue_name", "attempts", "max_retries"
+            "id", "queue_name", "task_path", "attempts", "max_retries"
         )
         return [
             ClaimedItem(
                 id=str(row["id"]),
                 queue_name=row["queue_name"],
+                task_path=row["task_path"],
                 attempt=row["attempts"],
                 max_retries=row["max_retries"],
             )
@@ -96,7 +104,7 @@ class PostgresBroker(Broker):
         )
 
     def reclaim_stale(
-        self, *, stale_before: datetime, limit: int, retry_backoff_seconds: float
+        self, *, stale_before: datetime, limit: int, retry_delay: RetryDelay
     ) -> list[ReclaimedItem]:
         now = timezone.now()
         with transaction.atomic():
@@ -111,11 +119,11 @@ class PostgresBroker(Broker):
 
             rows = list(
                 DBTaskResult.objects.filter(id__in=ids).values(
-                    "id", "delivery_guarantee", "attempts", "max_retries", "errors"
+                    "id", "task_path", "delivery_guarantee", "attempts", "max_retries", "errors"
                 )
             )
 
-            retry_ids = []
+            retry_rows = []
             fail_rows = []
             for row in rows:
                 can_retry = (
@@ -123,14 +131,15 @@ class PostgresBroker(Broker):
                     and retries_remaining(row["attempts"], row["max_retries"])
                 )
                 if can_retry:
-                    retry_ids.append(row["id"])
+                    retry_rows.append(row)
                 else:
                     fail_rows.append(row)
 
-            if retry_ids:
-                DBTaskResult.objects.filter(id__in=retry_ids).update(
+            for row in retry_rows:
+                delay = retry_delay(row["task_path"], row["attempts"])
+                DBTaskResult.objects.filter(id=row["id"]).update(
                     status=TaskStatus.READY,
-                    run_after=now + timedelta(seconds=retry_backoff_seconds),
+                    run_after=now + timedelta(seconds=delay),
                     claimed_by="",
                     claimed_at=None,
                     last_heartbeat_at=None,

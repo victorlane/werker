@@ -1,0 +1,58 @@
+"""Per-task policy registry, @retry validation, and backoff timing."""
+
+import random
+
+import pytest
+from django.core.exceptions import ImproperlyConfigured
+
+from werker import registry
+from werker.models import DeliveryGuarantee
+from werker.retry import backoff_delay
+
+
+def test_stacked_decorators_merge_into_one_policy():
+    path = "tests.unit.test_policies.merged"
+    registry.set_policy(path, delivery=DeliveryGuarantee.AT_MOST_ONCE)
+    registry.set_policy(path, max_retries=5)
+
+    policy = registry.policy_for(path)
+    assert policy.delivery == DeliveryGuarantee.AT_MOST_ONCE
+    assert policy.max_retries == 5
+    assert registry.delivery_guarantee_for(path) == DeliveryGuarantee.AT_MOST_ONCE
+
+
+def test_unknown_task_gets_the_default_policy():
+    policy = registry.policy_for("tests.unit.test_policies.nothing")
+    assert policy.max_retries is None
+    assert registry.delivery_guarantee_for("x") == DeliveryGuarantee.AT_LEAST_ONCE
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"max_retries": -1},
+        {"max_retries": True},
+        {"backoff_base": 0},
+        {"backoff_max": -5},
+        {"on": (ValueError, "nope")},
+    ],
+)
+def test_retry_rejects_bad_arguments(kwargs):
+    from werker.decorators import retry
+
+    with pytest.raises(ImproperlyConfigured):
+        retry(**kwargs)
+
+
+def test_backoff_without_jitter_is_exponential_and_capped():
+    assert backoff_delay(1, base=2, maximum=300, jitter=False) == 2
+    assert backoff_delay(3, base=2, maximum=300, jitter=False) == 8
+    assert backoff_delay(20, base=2, maximum=300, jitter=False) == 300
+    assert backoff_delay(5000, base=2.0, maximum=300, jitter=False) == 300
+
+
+def test_backoff_jitter_stays_between_half_and_full_delay():
+    random.seed(1)
+    delays = [backoff_delay(4, base=2, maximum=300, jitter=True) for _ in range(200)]
+    assert all(8 <= d <= 16 for d in delays)
+    assert len(set(delays)) > 1

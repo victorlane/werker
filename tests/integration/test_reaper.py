@@ -38,7 +38,9 @@ def test_at_least_once_with_retries_remaining_is_retried():
 
     broker = PostgresBroker(options=None)
     reclaimed = broker.reclaim_stale(
-        stale_before=timezone.now() - timedelta(minutes=5), limit=10, retry_backoff_seconds=1.0
+        stale_before=timezone.now() - timedelta(minutes=5),
+        limit=10,
+        retry_delay=lambda path, attempt: 1.0,
     )
 
     assert [item.action for item in reclaimed] == ["retried"]
@@ -56,7 +58,9 @@ def test_at_least_once_with_retries_exhausted_is_failed():
 
     broker = PostgresBroker(options=None)
     reclaimed = broker.reclaim_stale(
-        stale_before=timezone.now() - timedelta(minutes=5), limit=10, retry_backoff_seconds=1.0
+        stale_before=timezone.now() - timedelta(minutes=5),
+        limit=10,
+        retry_delay=lambda path, attempt: 1.0,
     )
 
     assert [item.action for item in reclaimed] == ["failed"]
@@ -73,7 +77,9 @@ def test_at_most_once_is_never_retried_even_with_retries_remaining():
 
     broker = PostgresBroker(options=None)
     reclaimed = broker.reclaim_stale(
-        stale_before=timezone.now() - timedelta(minutes=5), limit=10, retry_backoff_seconds=1.0
+        stale_before=timezone.now() - timedelta(minutes=5),
+        limit=10,
+        retry_delay=lambda path, attempt: 1.0,
     )
 
     assert [item.action for item in reclaimed] == ["failed"]
@@ -90,7 +96,9 @@ def test_fresh_heartbeat_is_not_reclaimed():
 
     broker = PostgresBroker(options=None)
     reclaimed = broker.reclaim_stale(
-        stale_before=timezone.now() - timedelta(minutes=5), limit=10, retry_backoff_seconds=1.0
+        stale_before=timezone.now() - timedelta(minutes=5),
+        limit=10,
+        retry_delay=lambda path, attempt: 1.0,
     )
 
     assert reclaimed == []

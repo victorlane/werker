@@ -43,6 +43,10 @@ class QueueItem:
     run_after: datetime
 
 
+#: (task_path, attempt) -> seconds to wait before the next attempt.
+RetryDelay = Callable[[str, int], float]
+
+
 def retries_remaining(attempt: int, max_retries: int) -> bool:
     """True if a task that just finished attempt number `attempt` (1-based)
     may run again. MAX_RETRIES counts retries, so MAX_RETRIES=n allows n+1
@@ -54,6 +58,7 @@ def retries_remaining(attempt: int, max_retries: int) -> bool:
 class ClaimedItem:
     id: str
     queue_name: str
+    task_path: str
     attempt: int
     #: Retry budget stored on the row at enqueue time, so a settings change
     #: doesn't alter tasks already in the queue.
@@ -132,21 +137,22 @@ class Broker(abc.ABC):
 
     @abc.abstractmethod
     def reclaim_stale(
-        self, *, stale_before: datetime, limit: int, retry_backoff_seconds: float
+        self, *, stale_before: datetime, limit: int, retry_delay: RetryDelay
     ) -> list[ReclaimedItem]:
         """Atomically reclaims RUNNING items with a stale heartbeat.
-        AT_LEAST_ONCE items with retries left go back to READY (retried);
-        everything else goes to FAILED (failed). Must lock-then-decide in
-        one transaction per item so a late heartbeat can't race the decision."""
+        AT_LEAST_ONCE items with retries left go back to READY (retried),
+        delayed by retry_delay(task_path, attempt) seconds; everything else
+        goes to FAILED (failed). Must lock-then-decide in one transaction per
+        item so a late heartbeat can't race the decision."""
 
     async def areclaim_stale(
-        self, *, stale_before: datetime, limit: int, retry_backoff_seconds: float
+        self, *, stale_before: datetime, limit: int, retry_delay: RetryDelay
     ) -> list[ReclaimedItem]:
         return await self._run_sync(
             self.reclaim_stale,
             stale_before=stale_before,
             limit=limit,
-            retry_backoff_seconds=retry_backoff_seconds,
+            retry_delay=retry_delay,
         )
 
     @abc.abstractmethod

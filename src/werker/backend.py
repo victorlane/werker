@@ -57,6 +57,12 @@ class PostgresTaskBackend(BaseTaskBackend):
         self.broker = broker_cls(self.options)
         self.result_store = result_store_cls(self.options)
 
+    def _max_retries_for(self, task_path: str) -> int:
+        policy_max_retries = registry.policy_for(task_path).max_retries
+        if policy_max_retries is not None:
+            return policy_max_retries
+        return int(self.options.get("MAX_RETRIES", DEFAULT_MAX_RETRIES))
+
     def enqueue_schedule(self, declaration: ScheduleDeclaration) -> str:
         """Enqueues one due periodic-task occurrence, mirroring enqueue() but
         seeded from a ScheduleDeclaration. Queues even if the underlying task
@@ -79,7 +85,7 @@ class PostgresTaskBackend(BaseTaskBackend):
                 "priority": declaration.priority,
                 "run_after": now,
                 "enqueued_at": now,
-                "max_retries": self.options.get("MAX_RETRIES", DEFAULT_MAX_RETRIES),
+                "max_retries": self._max_retries_for(declaration.task_path),
                 "delivery_guarantee": registry.delivery_guarantee_for(
                     declaration.task_path
                 ),
@@ -108,7 +114,7 @@ class PostgresTaskBackend(BaseTaskBackend):
             "priority": task.priority,
             "run_after": run_after,
             "enqueued_at": now,
-            "max_retries": self.options.get("MAX_RETRIES", DEFAULT_MAX_RETRIES),
+            "max_retries": self._max_retries_for(task.module_path),
             "delivery_guarantee": registry.delivery_guarantee_for(task.module_path),
         }
         return result_id, queue_item, create_kwargs

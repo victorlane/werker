@@ -102,6 +102,7 @@ Put options under `TASKS[alias]["OPTIONS"]`. All numeric options are validated w
 | `MAX_RETRIES` | `3` | Retry budget written to each newly enqueued task. See retry semantics below. `0` disables retries. |
 | `RETRY_BACKOFF_BASE` | `2.0` seconds | Exponential retry base: an attempt numbered `n` waits `base ** n`. |
 | `RETRY_BACKOFF_MAX` | `300` seconds | Maximum failure retry delay. |
+| `RETRY_JITTER` | `True` | Randomise each retry delay to between half and all of the computed delay, so tasks that failed together don't retry together. |
 | `HEARTBEAT_INTERVAL` | `15` seconds | How often a running task renews its lease. |
 | `STALE_RUNNING_TIMEOUT` | `300` seconds | A RUNNING task with an older heartbeat can be reclaimed. |
 | `REAPER_POLL_INTERVAL` | `30` seconds | Stale-claim recovery polling interval. |
@@ -127,6 +128,23 @@ TASKS = {"default": {"BACKEND": "werker.backend.PostgresTaskBackend", "OPTIONS":
 ## Retries and delivery guarantees
 
 An exception from a task is recorded (including its traceback). While retry budget remains, the task becomes READY again with an exponential delay; after the budget is exhausted, it is FAILED. A worker that crashes or is unable to finish before its heartbeat becomes stale is handled by the reaper similarly.
+
+`MAX_RETRIES=n` allows `n` retries, so `n + 1` attempts in total. The budget is stored on each task when it is enqueued, so changing the setting later doesn't affect tasks already in the queue.
+
+Override the retry options for a single task with `@retry`, outside `@task`. `on` limits retries to the listed exception types; any other exception fails the task immediately:
+
+```python
+from smtplib import SMTPException
+from django.tasks import task
+from werker.decorators import retry
+
+@retry(max_retries=5, on=(SMTPException,), backoff_base=3, backoff_max=600)
+@task
+def send_invoice(invoice_id: int) -> None:
+    ...
+```
+
+Arguments you leave out fall back to the backend `OPTIONS`.
 
 The default is **at-least-once** delivery. A stale task with retries remaining may execute again, so task functions must be idempotent: use durable idempotency keys, unique constraints, transactional outboxes, or provider-side deduplication for externally visible effects. Werker does **not** provide exactly-once execution.
 

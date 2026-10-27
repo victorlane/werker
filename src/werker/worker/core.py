@@ -29,9 +29,11 @@ from django.tasks.signals import task_finished, task_started
 from django.utils import timezone
 from django.utils.json import normalize_json
 
+from werker import registry
 from werker.backend import PostgresTaskBackend
 from werker.broker import ClaimedItem, retries_remaining
 from werker.config import validate_options
+from werker.retry import backoff_delay
 from werker.worker.executor import create_executor, run_with_connection_cleanup
 from werker.worker.reaper import reaper_loop
 from werker.worker.scheduler import scheduler_loop
@@ -85,6 +87,7 @@ class Worker:
         self.retry_backoff_max: float = options.get(
             "RETRY_BACKOFF_MAX", DEFAULT_RETRY_BACKOFF_MAX
         )
+        self.retry_jitter: bool = options.get("RETRY_JITTER", True)
         self.heartbeat_interval: float = options.get(
             "HEARTBEAT_INTERVAL", DEFAULT_HEARTBEAT_INTERVAL
         )
@@ -127,6 +130,17 @@ class Worker:
             # can't be force-killed from here, don't block on it too.
             self._executor.shutdown(wait=False, cancel_futures=True)
             logger.info("werker worker %s stopped", self.worker_id)
+
+    def retry_delay(self, task_path: str, attempt: int) -> float:
+        """Seconds before the next attempt, from the task's @retry policy
+        or the backend options."""
+        policy = registry.policy_for(task_path)
+        return backoff_delay(
+            attempt,
+            base=policy.backoff_base or self.retry_backoff_base,
+            maximum=policy.backoff_max or self.retry_backoff_max,
+            jitter=self.retry_jitter if policy.jitter is None else policy.jitter,
+        )
 
     def request_shutdown(self) -> None:
         """Starts a graceful shutdown. Not thread-safe: from another thread,
@@ -316,7 +330,10 @@ class Worker:
             "exception_class_path": f"{exception_type.__module__}.{exception_type.__qualname__}",
             "traceback": "".join(traceback.format_exception(exc)),
         }
+        policy = registry.policy_for(item.task_path)
         will_retry = retries_remaining(item.attempt, item.max_retries)
+        if policy.retry_on is not None and not isinstance(exc, policy.retry_on):
+            will_retry = False
         owns_claim = await self.backend.result_store.amark_failed(
             item.id,
             worker_id=self.worker_id,
@@ -328,10 +345,7 @@ class Worker:
             return
 
         if will_retry:
-            delay = min(
-                self.retry_backoff_base**item.attempt,
-                self.retry_backoff_max,
-            )
+            delay = self.retry_delay(item.task_path, item.attempt)
             retry_after = timezone.now() + timedelta(seconds=delay)
             await self.backend.broker.anack(
                 item.id, worker_id=self.worker_id, attempt=item.attempt, retry_after=retry_after

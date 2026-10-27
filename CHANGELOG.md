@@ -24,6 +24,11 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reclaims it.
 
 ### Added
+- `@retry` decorator: per-task retry budget, exception filter (`on=`) and
+  backoff settings.
+- `RETRY_JITTER` option (default on) that randomises retry delays.
+- The reaper now delays a reclaimed task with the same exponential backoff
+  as a failed one, instead of a flat `RETRY_BACKOFF_BASE` seconds.
 - `postgres` extra that installs `psycopg[binary]`.
 - Initial Postgres-backed Django task backend, worker, result storage, retry
   handling, periodic schedules, and operational management commands.
