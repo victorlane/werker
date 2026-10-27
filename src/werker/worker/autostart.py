@@ -8,6 +8,7 @@ when:
   * this is the process that actually serves requests: the autoreloader's
     child (RUN_MAIN=true), or the only process under `--noreload`, and
   * `WERKER_AUTOSTART` is truthy (defaults to True under runserver), and
+  * TASKS["default"] uses werker's backend, and
   * a worker isn't already running in this process.
 
 The autoreloader's parent process only watches files, so starting a worker
@@ -43,6 +44,11 @@ class AutostartManager:
         if cls._thread is not None:
             return False
         if not _is_runserver() or not getattr(settings, "WERKER_AUTOSTART", True):
+            return False
+        if not _default_backend_is_werker():
+            # e.g. a project that falls back to ImmediateBackend without
+            # Postgres. Nothing to run, so don't start a worker that can't.
+            logger.debug("werker autostart skipped: default task backend is not werker")
             return False
 
         from werker.worker.core import Worker
@@ -81,3 +87,14 @@ def _is_runserver() -> bool:
     if "runserver" not in sys.argv:
         return False
     return os.environ.get("RUN_MAIN") == "true" or "--noreload" in sys.argv
+
+
+def _default_backend_is_werker() -> bool:
+    from django.tasks import task_backends
+
+    from werker.backend import PostgresTaskBackend
+
+    try:
+        return isinstance(task_backends["default"], PostgresTaskBackend)
+    except Exception:
+        return False

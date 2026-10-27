@@ -91,3 +91,13 @@ def test_is_idempotent_within_one_process(monkeypatch):
     assert AutostartManager.start_if_requested() is True
     # Second call in the same process must not spawn another thread.
     assert AutostartManager.start_if_requested() is False
+
+
+@override_settings(
+    TASKS={"default": {"BACKEND": "django.tasks.backends.immediate.ImmediateBackend"}}
+)
+def test_does_not_start_when_default_backend_is_not_werker(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["manage.py", "runserver"])
+    monkeypatch.setenv("RUN_MAIN", "true")
+    assert AutostartManager.start_if_requested() is False
+    assert AutostartManager._thread is None
