@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from django.db import connections, router, transaction
-from django.db.models import F, Q, QuerySet
+from django.db.models import Case, F, Q, QuerySet, When
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 
@@ -204,6 +204,29 @@ class PostgresBroker(Broker):
         ).update(
             claimed_by="", claimed_at=None, last_heartbeat_at=None
         )
+
+    def release(self, item: ClaimedItem, *, worker_id: str) -> bool:
+        first_attempt = Q(attempts=1)
+        with transaction.atomic():
+            released = DBTaskResult.objects.filter(
+                id=item.id, claimed_by=worker_id, attempts=item.attempt
+            ).update(
+                status=TaskStatus.READY,
+                attempts=F("attempts") - 1,
+                started_at=Case(When(first_attempt, then=None), default=F("started_at")),
+                last_attempted_at=Case(
+                    When(first_attempt, then=None), default=F("last_attempted_at")
+                ),
+                claimed_by="",
+                claimed_at=None,
+                last_heartbeat_at=None,
+            )
+            if not released:
+                return False
+            # Refill math caps the bucket at its capacity on the next claim.
+            RateLimitBucket.objects.filter(key=item.task_path).update(tokens=F("tokens") + 1)
+            notify_queue(item.queue_name)
+        return True
 
     def nack(self, item_id: str, *, worker_id: str, attempt: int, retry_after: datetime) -> None:
         DBTaskResult.objects.filter(

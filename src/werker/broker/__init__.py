@@ -143,6 +143,15 @@ class Broker(abc.ABC):
         await self._run_sync(self.ack, item_id, worker_id=worker_id, attempt=attempt)
 
     @abc.abstractmethod
+    def release(self, item: ClaimedItem, *, worker_id: str) -> bool:
+        """Undo a claim the worker can't start yet: back to READY as if never
+        claimed, without counting the attempt or spending a rate-limit token.
+        False if this worker no longer holds the claim."""
+
+    async def arelease(self, item: ClaimedItem, *, worker_id: str) -> bool:
+        return await self._run_sync(self.release, item, worker_id=worker_id)
+
+    @abc.abstractmethod
     def nack(self, item_id: str, *, worker_id: str, attempt: int, retry_after: datetime) -> None:
         """Release an item back to the queue, eligible for re-claim at retry_after."""
 

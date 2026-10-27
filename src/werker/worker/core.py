@@ -31,6 +31,7 @@ from django.tasks.base import TaskContext
 from django.tasks.signals import task_finished, task_started
 from django.utils import timezone
 from django.utils.json import normalize_json
+from django.utils.module_loading import import_string
 
 from werker import registry
 from werker.backend import PostgresTaskBackend
@@ -68,6 +69,16 @@ LISTENING_POLL_INTERVAL = 5.0
 
 def make_worker_id() -> str:
     return f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+
+
+def _needs_thread(task_path: str) -> bool:
+    """Whether the task runs in the sync thread pool. An unimportable task
+    doesn't: it fails fast in _run_claimed without one."""
+    try:
+        task = import_string(task_path)
+    except ImportError:
+        return False
+    return not iscoroutinefunction(task.func)
 
 
 class Worker:
@@ -136,6 +147,7 @@ class Worker:
         self._inflight: set[asyncio.Task[None]] = set()
         # Sync task threads that timed out but haven't returned yet.
         self._abandoned = 0
+        self._sync_inflight: set[asyncio.Task[None]] = set()
         # Ids of running tasks whose cancelling was requested.
         self._cancel_requested: set[str] = set()
         # Set by the listener on a NOTIFY for our queues, and when a task
@@ -214,9 +226,13 @@ class Worker:
         # Capacity freed up; claim more without waiting for the next poll.
         self._wakeup.set()
 
+    def _free_sync_slots(self) -> int:
+        # Abandoned (timed-out) sync threads still occupy the pool.
+        return self.concurrency - len(self._sync_inflight) - self._abandoned
+
     def _available_capacity(self) -> int:
-        in_use = len(self._inflight) + self._abandoned
-        return (self.concurrency + self.max_async_concurrency) - in_use
+        async_inflight = len(self._inflight) - len(self._sync_inflight)
+        return self._free_sync_slots() + self.max_async_concurrency - async_inflight
 
     async def _wait_or_shutdown(self, timeout: float) -> None:
         """Sleeps up to `timeout` seconds, or returns early if shutdown fires."""
@@ -273,12 +289,41 @@ class Worker:
                 await self._wait_for_work(wait)
                 continue
 
+            released_any = False
             for item in claimed:
-                task_coro = asyncio.ensure_future(self._execute(item))
-                self._inflight.add(task_coro)
-                task_coro.add_done_callback(self._task_done)
+                needs_thread = _needs_thread(item.task_path)
+                if needs_thread and self._free_sync_slots() <= 0:
+                    # Hand it back for a worker with a free thread rather
+                    # than hoarding it in our executor's queue.
+                    await self._release(item)
+                    released_any = True
+                    continue
+                self._start(item, needs_thread=needs_thread)
+
+            if released_any:
+                # Wait for a thread to free up (_task_done wakes us) instead
+                # of re-claiming the same work straight away.
+                await self._wait_for_work(self.poll_interval)
 
         await self._drain_inflight()
+
+    def _start(self, item: ClaimedItem, *, needs_thread: bool) -> None:
+        task_coro = asyncio.ensure_future(self._execute(item))
+        self._inflight.add(task_coro)
+        if needs_thread:
+            self._sync_inflight.add(task_coro)
+            task_coro.add_done_callback(self._sync_inflight.discard)
+        task_coro.add_done_callback(self._task_done)
+
+    async def _release(self, item: ClaimedItem) -> None:
+        try:
+            await self.backend.broker.arelease(item, worker_id=self.worker_id)
+        except Exception:
+            logger.exception(
+                "werker worker %s failed to release id=%s; the reaper will reclaim it",
+                self.worker_id,
+                item.id,
+            )
 
     async def _drain_inflight(self) -> None:
         if not self._inflight:
