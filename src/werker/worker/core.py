@@ -19,8 +19,10 @@ import signal
 import socket
 import traceback
 import uuid
+from collections.abc import Callable, Coroutine
 from datetime import timedelta
 from inspect import iscoroutinefunction
+from typing import Any
 
 from django.core.exceptions import ImproperlyConfigured
 from django.tasks import task_backends
@@ -33,6 +35,8 @@ from werker import registry
 from werker.backend import PostgresTaskBackend
 from werker.broker import ClaimedItem, retries_remaining
 from werker.config import validate_options
+from werker.exceptions import TaskTimeout
+from werker.models import DeliveryGuarantee
 from werker.retry import backoff_delay
 from werker.worker.executor import create_executor, run_with_connection_cleanup
 from werker.worker.reaper import reaper_loop
@@ -103,11 +107,14 @@ class Worker:
         self.shutdown_grace_period: float = options.get(
             "SHUTDOWN_GRACE_PERIOD", DEFAULT_SHUTDOWN_GRACE_PERIOD
         )
+        self.task_timeout: float | None = options.get("TASK_TIMEOUT")
 
         self._executor = create_executor(self.concurrency)
         self._async_semaphore = asyncio.Semaphore(self.max_async_concurrency)
         self._shutdown = asyncio.Event()
         self._inflight: set[asyncio.Task[None]] = set()
+        # Sync task threads that timed out but haven't returned yet.
+        self._abandoned = 0
 
     async def run(self) -> None:
         self._install_signal_handlers()
@@ -159,7 +166,8 @@ class Worker:
                 pass
 
     def _available_capacity(self) -> int:
-        return (self.concurrency + self.max_async_concurrency) - len(self._inflight)
+        in_use = len(self._inflight) + self._abandoned
+        return (self.concurrency + self.max_async_concurrency) - in_use
 
     async def _wait_or_shutdown(self, timeout: float) -> None:
         """Sleeps up to `timeout` seconds, or returns early if shutdown fires."""
@@ -269,17 +277,20 @@ class Worker:
         )
 
         heartbeat_sender = asyncio.ensure_future(self._heartbeat_sender(item))
+        task_timeout = self._timeout_for(item.task_path)
         try:
             if iscoroutinefunction(task.func):
                 async with self._async_semaphore:
-                    raw_return_value = await task.func(*call_args, **result.kwargs)
+                    raw_return_value = await self._call_async(
+                        item, task.func(*call_args, **result.kwargs), task_timeout
+                    )
             else:
-                loop = asyncio.get_running_loop()
-                raw_return_value = await loop.run_in_executor(
-                    self._executor,
+                raw_return_value = await self._call_sync(
+                    item,
                     functools.partial(
                         run_with_connection_cleanup, task.func, *call_args, **result.kwargs
                     ),
+                    task_timeout,
                 )
         except asyncio.CancelledError:
             # Shutdown abandoned this task; the reaper reclaims it.
@@ -315,6 +326,60 @@ class Worker:
         finished_result = await self.backend.aget_result(item.id)
         task_finished.send(sender=type(self.backend), task_result=finished_result)
 
+    def _timeout_for(self, task_path: str) -> float | None:
+        policy_timeout = registry.policy_for(task_path).timeout
+        return policy_timeout if policy_timeout is not None else self.task_timeout
+
+    async def _call_async(
+        self, item: ClaimedItem, coro: Coroutine[Any, Any, Any], task_timeout: float | None
+    ) -> Any:
+        """Awaits an async task, cancelling it cleanly past its timeout."""
+        deadline = asyncio.timeout(task_timeout)
+        try:
+            async with deadline:
+                return await coro
+        except TimeoutError as exc:
+            if deadline.expired():
+                raise TaskTimeout(f"{item.task_path} exceeded {task_timeout}s") from exc
+            raise
+
+    async def _call_sync(
+        self, item: ClaimedItem, call: Callable[[], Any], task_timeout: float | None
+    ) -> Any:
+        """Runs a sync task in the thread pool. A thread can't be killed, so
+        past its timeout the task is recorded as failed and the thread is
+        abandoned. It keeps a pool slot until it ends, so _abandoned lowers
+        the claim capacity until then."""
+        thread_future = self._executor.submit(call)
+        future = asyncio.wrap_future(thread_future)
+        done, _ = await asyncio.wait({future}, timeout=task_timeout)
+        if done:
+            return future.result()
+
+        loop = asyncio.get_running_loop()
+        self._abandoned += 1
+        logger.warning(
+            "werker worker %s abandoned task %s (%s) after %ss timeout; its thread "
+            "keeps running until the function returns",
+            self.worker_id,
+            item.id,
+            item.task_path,
+            task_timeout,
+        )
+        # Retrieve the eventual outcome so asyncio doesn't log it as unhandled.
+        future.add_done_callback(lambda f: f.cancelled() or f.exception())
+        thread_future.add_done_callback(lambda _: self._call_in_loop(loop, self._release_abandoned))
+        raise TaskTimeout(f"{item.task_path} exceeded {task_timeout}s")
+
+    def _release_abandoned(self) -> None:
+        self._abandoned -= 1
+
+    @staticmethod
+    def _call_in_loop(loop: asyncio.AbstractEventLoop, callback: Callable[[], None]) -> None:
+        # The loop may already be closed if the worker stopped meanwhile.
+        with contextlib.suppress(RuntimeError):
+            loop.call_soon_threadsafe(callback)
+
     async def _heartbeat_sender(self, item: ClaimedItem) -> None:
         """Keeps this exact claim attempt's heartbeat fresh. Cancelled as soon
         as execution finishes, see _run_claimed's finally block."""
@@ -333,6 +398,13 @@ class Worker:
         policy = registry.policy_for(item.task_path)
         will_retry = retries_remaining(item.attempt, item.max_retries)
         if policy.retry_on is not None and not isinstance(exc, policy.retry_on):
+            will_retry = False
+        if (
+            isinstance(exc, TaskTimeout)
+            and registry.delivery_guarantee_for(item.task_path)
+            == DeliveryGuarantee.AT_MOST_ONCE
+        ):
+            # An abandoned sync thread may still be running it.
             will_retry = False
         owns_claim = await self.backend.result_store.amark_failed(
             item.id,

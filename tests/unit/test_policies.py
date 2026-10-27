@@ -56,3 +56,22 @@ def test_backoff_jitter_stays_between_half_and_full_delay():
     delays = [backoff_delay(4, base=2, maximum=300, jitter=True) for _ in range(200)]
     assert all(8 <= d <= 16 for d in delays)
     assert len(set(delays)) > 1
+
+
+@pytest.mark.parametrize("seconds", [0, -1, True, "5"])
+def test_timeout_rejects_bad_seconds(seconds):
+    from werker.decorators import timeout
+
+    with pytest.raises(ImproperlyConfigured):
+        timeout(seconds)
+
+
+def test_task_timeout_option_accepts_none_but_not_zero():
+    from werker.config import validate_options
+
+    validate_options({"TASK_TIMEOUT": None})
+    validate_options({"TASK_TIMEOUT": 2.5})
+    with pytest.raises(ImproperlyConfigured):
+        validate_options({"TASK_TIMEOUT": 0})
+    with pytest.raises(ImproperlyConfigured):
+        validate_options({"RETRY_JITTER": "yes"})

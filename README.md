@@ -102,6 +102,7 @@ Put options under `TASKS[alias]["OPTIONS"]`. All numeric options are validated w
 | `MAX_RETRIES` | `3` | Retry budget written to each newly enqueued task. See retry semantics below. `0` disables retries. |
 | `RETRY_BACKOFF_BASE` | `2.0` seconds | Exponential retry base: an attempt numbered `n` waits `base ** n`. |
 | `RETRY_BACKOFF_MAX` | `300` seconds | Maximum failure retry delay. |
+| `TASK_TIMEOUT` | `None` (no limit) | Seconds an attempt may run before it fails with `werker.exceptions.TaskTimeout`. See [Timeouts](#timeouts). |
 | `RETRY_JITTER` | `True` | Randomise each retry delay to between half and all of the computed delay, so tasks that failed together don't retry together. |
 | `HEARTBEAT_INTERVAL` | `15` seconds | How often a running task renews its lease. |
 | `STALE_RUNNING_TIMEOUT` | `300` seconds | A RUNNING task with an older heartbeat can be reclaimed. |
@@ -161,6 +162,24 @@ def charge_customer(payment_id: str) -> None:
 ```
 
 An at-most-once task with a stale claim is failed rather than reclaimed. It can therefore be lost on a worker crash. The decorator must be outside `@task`.
+
+## Timeouts
+
+Set a time limit for one task with `@timeout`, or for all tasks with the `TASK_TIMEOUT` option. An attempt that runs longer fails with `werker.exceptions.TaskTimeout` and is retried like any other failure:
+
+```python
+from django.tasks import task
+from werker.decorators import timeout
+
+@timeout(30)
+@task
+def render_report(report_id: int) -> None:
+    ...
+```
+
+- **Async tasks** are cancelled cleanly at the deadline.
+- **Sync tasks** run in a thread, and Python can't kill a thread. The attempt is recorded as failed, but the thread keeps running until the function returns. It keeps its worker slot until then, so the worker claims less new work. A retry can overlap with the abandoned thread, so sync tasks with a timeout must be idempotent.
+- **At-most-once tasks** are never retried after a timeout, because the first attempt may still be running.
 
 ## Periodic schedules
 

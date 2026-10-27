@@ -27,6 +27,8 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `@retry` decorator: per-task retry budget, exception filter (`on=`) and
   backoff settings.
 - `RETRY_JITTER` option (default on) that randomises retry delays.
+- `@timeout` decorator and `TASK_TIMEOUT` option: an attempt that runs too
+  long fails with `werker.exceptions.TaskTimeout`.
 - The reaper now delays a reclaimed task with the same exponential backoff
   as a failed one, instead of a flat `RETRY_BACKOFF_BASE` seconds.
 - `postgres` extra that installs `psycopg[binary]`.

@@ -70,3 +70,21 @@ def retry(
         return task
 
     return decorate
+
+
+def timeout(seconds: float) -> TaskDecorator:
+    """Fails an attempt that runs longer than `seconds`, then retries it per
+    the retry policy. Overrides the backend's TASK_TIMEOUT option.
+
+    An async task is cancelled cleanly. A sync task's thread can't be
+    killed: it is abandoned and keeps running until the function returns,
+    so a retry can overlap with it. An at-most-once task is never retried
+    after a timeout for that reason."""
+    if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or seconds <= 0:
+        raise ImproperlyConfigured("timeout(seconds=...) must be greater than zero.")
+
+    def decorate(task: Task[..., Any]) -> Task[..., Any]:
+        registry.set_policy(task.module_path, timeout=float(seconds))
+        return task
+
+    return decorate

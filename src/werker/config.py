@@ -21,9 +21,12 @@ _POSITIVE_NUMBERS = {
     "REAPER_POLL_INTERVAL",
     "SCHEDULER_POLL_INTERVAL",
     "STALE_SCHEDULE_CLAIM_TIMEOUT",
+    "TASK_TIMEOUT",
 }
 _NON_NEGATIVE_NUMBERS = {"SHUTDOWN_GRACE_PERIOD"}
 _BOOLEANS = {"RETRY_JITTER"}
+#: May be None, meaning "no limit".
+_OPTIONAL = {"TASK_TIMEOUT"}
 
 
 def validate_options(options: Any) -> None:
@@ -39,6 +42,8 @@ def validate_options(options: Any) -> None:
         raise ImproperlyConfigured("TASKS OPTIONS must be a mapping.")
 
     for key, value in options.items():
+        if value is None and key in _OPTIONAL:
+            continue
         if key in _BOOLEANS:
             if not isinstance(value, bool):
                 raise ImproperlyConfigured(f"TASKS OPTIONS[{key!r}] must be True or False.")
