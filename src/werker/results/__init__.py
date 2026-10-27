@@ -59,6 +59,7 @@ class ResultStore(abc.ABC):
         enqueued_at: datetime,
         max_retries: int,
         delivery_guarantee: DeliveryGuarantee = DeliveryGuarantee.AT_LEAST_ONCE,
+        unique_key: str | None = None,
     ) -> None: ...
 
     async def acreate(self, **kwargs: Any) -> None:

@@ -2,6 +2,8 @@ import uuid
 
 from django.db import models
 
+UNIQUE_ACTIVE_CONSTRAINT = "werker_unique_active"
+
 
 class TaskStatus(models.TextChoices):
     """Mirrors django.tasks.TaskResultStatus."""
@@ -64,12 +66,25 @@ class DBTaskResult(models.Model):
     claimed_by = models.CharField(max_length=255, blank=True, default="")
     claimed_at = models.DateTimeField(null=True, blank=True)
     last_heartbeat_at = models.DateTimeField(null=True, blank=True)
+    #: Set by werker.api.cancel on a RUNNING task; the worker notices it on
+    #: its next heartbeat.
+    cancel_requested_at = models.DateTimeField(null=True, blank=True)
+    #: Set for @unique tasks. Only one READY or RUNNING row may hold a key.
+    #: NULL (not "") for other tasks, since the unique constraint ignores NULLs.
+    unique_key = models.CharField(max_length=255, null=True, blank=True)  # noqa: DJ001
 
     class Meta:
         indexes = [
             models.Index(
                 fields=["status", "queue_name", "-priority", "run_after"],
                 name="werker_claim_idx",
+            ),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["unique_key"],
+                condition=models.Q(status__in=["READY", "RUNNING"]),
+                name=UNIQUE_ACTIVE_CONSTRAINT,
             ),
         ]
 
@@ -118,3 +133,31 @@ class PeriodicTask(models.Model):
 
     def __str__(self) -> str:
         return self.name
+
+
+class WorkerRecord(models.Model):
+    """One row per worker process, kept fresh while it runs. Used for the
+    admin's worker list and `werker_health --db`."""
+
+    worker_id = models.CharField(max_length=255, primary_key=True)
+    hostname = models.CharField(max_length=255)
+    pid = models.PositiveIntegerField()
+    queues = models.JSONField(default=list)
+    started_at = models.DateTimeField()
+    last_seen_at = models.DateTimeField(db_index=True)
+    stopped_at = models.DateTimeField(null=True, blank=True)
+
+    def __str__(self) -> str:
+        return self.worker_id
+
+
+class RateLimitBucket(models.Model):
+    """One row per @rate_limit task path. Holds the token bucket for `rate`
+    and serializes claimers that check `concurrency`."""
+
+    key = models.CharField(max_length=255, primary_key=True)
+    tokens = models.FloatField()
+    updated_at = models.DateTimeField()
+
+    def __str__(self) -> str:
+        return self.key

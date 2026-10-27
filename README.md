@@ -78,16 +78,48 @@ Avoid waiting inside web requests for long-running work; return the result ID an
 ## Worker operation
 
 ```text
-python manage.py taskworker [--backend ALIAS] [--queues first,second] [--once]
+python manage.py taskworker [--backend ALIAS] [--queues first,second] [--once] [--health-file PATH]
 ```
 
 - `--backend` selects the `TASKS` alias (default: `default`).
 - `--queues` restricts claims to comma-separated queues; by default the backend's configured queues are used.
+- `--health-file` touches a file on every pass of the worker loop, for liveness probes (see [Health checks](#health-checks)).
 - `--once` drains work that is due *at invocation time* and exits. It does not run periodic scheduling or stale-claim recovery; use it for checks, not a long-running deployment.
 
 Run at least one continuously running `taskworker` process. Multiple workers may share queues and schedules safely; PostgreSQL row locking prevents two workers from claiming the same ready task. Use your service manager (systemd, Kubernetes, etc.) to restart workers after failure and deploy schedule changes with `syncschedules` (below).
 
 During `python manage.py runserver`, a daemon worker starts automatically for local development. Set `WERKER_AUTOSTART = False` to disable it. This is not a production process-management strategy.
+
+### Instant pickup with LISTEN/NOTIFY
+
+Enqueueing a task that is due now sends a Postgres `NOTIFY` inside the enqueue transaction, so it is delivered only when that transaction commits. Each worker holds one extra connection that `LISTEN`s and wakes the worker straight away, instead of waiting up to `POLL_INTERVAL`.
+
+Polling stays on as a safety net, at least every 5 seconds while listening: it picks up delayed tasks (`run_after`) and anything enqueued while the listener was reconnecting. If `psycopg` is missing or the `LISTEN` connection fails, the worker logs a warning and keeps polling at `POLL_INTERVAL`.
+
+`LISTEN` doesn't work through pgbouncer in transaction mode. Add a database alias with a direct connection and set `LISTEN_DATABASE` to it, or set `LISTEN_NOTIFY` to `False`.
+
+### Health checks
+
+Every worker keeps a row in the `WorkerRecord` table, refreshed every `HEARTBEAT_INTERVAL` and marked stopped on a graceful shutdown. The admin lists workers with an "alive" column.
+
+`werker_health` exits 0 when healthy and 1 otherwise:
+
+```bash
+python manage.py werker_health --file /tmp/werker-alive --max-age 60  # no database query
+python manage.py werker_health --db [--hostname HOST] [--max-age SECONDS]
+```
+
+`--file` checks the file written by `taskworker --health-file`. Because the worker touches it on every loop pass, a stale file also means a stuck worker, not only a dead one. `--db` checks that at least one worker sent a heartbeat recently (default: within 3 × `HEARTBEAT_INTERVAL`).
+
+Kubernetes example:
+
+```yaml
+command: ["python", "manage.py", "taskworker", "--health-file", "/tmp/werker-alive"]
+livenessProbe:
+  exec:
+    command: ["python", "manage.py", "werker_health", "--file", "/tmp/werker-alive", "--max-age", "60"]
+  periodSeconds: 30
+```
 
 ### Worker `OPTIONS`
 
@@ -102,6 +134,13 @@ Put options under `TASKS[alias]["OPTIONS"]`. All numeric options are validated w
 | `MAX_RETRIES` | `3` | Retry budget written to each newly enqueued task. See retry semantics below. `0` disables retries. |
 | `RETRY_BACKOFF_BASE` | `2.0` seconds | Exponential retry base: an attempt numbered `n` waits `base ** n`. |
 | `RETRY_BACKOFF_MAX` | `300` seconds | Maximum failure retry delay. |
+| `LISTEN_NOTIFY` | `True` | Wake idle workers with Postgres `LISTEN/NOTIFY` as soon as a task is enqueued. See [Instant pickup](#instant-pickup-with-listennotify). |
+| `LISTEN_DATABASE` | the task table's database | Database alias for the `LISTEN` connection. Point it at a direct connection when the main one goes through pgbouncer in transaction mode. |
+| `RESULT_TTL` | `None` (keep everything) | Automatic cleanup: how long to keep finished tasks per status, e.g. `{"SUCCESSFUL": "7d", "FAILED": "30d"}`. See [Retention](#retention). |
+| `CLEANUP_INTERVAL` | `3600` seconds | How often a worker runs the `RESULT_TTL` cleanup. |
+| `HEALTH_FILE` | `None` | Path the worker touches on every loop pass. `taskworker --health-file` overrides it. |
+| `TASK_TIMEOUT` | `None` (no limit) | Seconds an attempt may run before it fails with `werker.exceptions.TaskTimeout`. See [Timeouts](#timeouts). |
+| `RETRY_JITTER` | `True` | Randomise each retry delay to between half and all of the computed delay, so tasks that failed together don't retry together. |
 | `HEARTBEAT_INTERVAL` | `15` seconds | How often a running task renews its lease. |
 | `STALE_RUNNING_TIMEOUT` | `300` seconds | A RUNNING task with an older heartbeat can be reclaimed. |
 | `REAPER_POLL_INTERVAL` | `30` seconds | Stale-claim recovery polling interval. |
@@ -128,6 +167,23 @@ TASKS = {"default": {"BACKEND": "werker.backend.PostgresTaskBackend", "OPTIONS":
 
 An exception from a task is recorded (including its traceback). While retry budget remains, the task becomes READY again with an exponential delay; after the budget is exhausted, it is FAILED. A worker that crashes or is unable to finish before its heartbeat becomes stale is handled by the reaper similarly.
 
+`MAX_RETRIES=n` allows `n` retries, so `n + 1` attempts in total. The budget is stored on each task when it is enqueued, so changing the setting later doesn't affect tasks already in the queue.
+
+Override the retry options for a single task with `@retry`, outside `@task`. `on` limits retries to the listed exception types; any other exception fails the task immediately:
+
+```python
+from smtplib import SMTPException
+from django.tasks import task
+from werker.decorators import retry
+
+@retry(max_retries=5, on=(SMTPException,), backoff_base=3, backoff_max=600)
+@task
+def send_invoice(invoice_id: int) -> None:
+    ...
+```
+
+Arguments you leave out fall back to the backend `OPTIONS`.
+
 The default is **at-least-once** delivery. A stale task with retries remaining may execute again, so task functions must be idempotent: use durable idempotency keys, unique constraints, transactional outboxes, or provider-side deduplication for externally visible effects. Werker does **not** provide exactly-once execution.
 
 For an operation where avoiding duplicates is more important than eventual execution, opt into **at-most-once** delivery:
@@ -143,6 +199,74 @@ def charge_customer(payment_id: str) -> None:
 ```
 
 An at-most-once task with a stale claim is failed rather than reclaimed. It can therefore be lost on a worker crash. The decorator must be outside `@task`.
+
+## Duplicate prevention
+
+`@unique` stops the same work from being queued twice. While a task with the same key is READY or RUNNING (including while it waits for a retry), enqueueing it again writes nothing and returns the existing result. Once that task has finished, it can be enqueued again.
+
+```python
+from django.tasks import task
+from werker.decorators import unique
+
+@unique  # key: the task's arguments
+@task
+def rebuild_search_index(section: str) -> None:
+    ...
+
+@unique(key=lambda user_id, **_: user_id)  # key: only user_id
+@task
+def sync_user(user_id: int, force: bool = False) -> None:
+    ...
+```
+
+A Postgres partial unique index enforces this, so it also holds for concurrent enqueues from different processes. The `task_enqueued` signal is only sent when a new row is created. A periodic task with `@unique` doesn't pile up when a run takes longer than its interval. `requeue` returns `False` for a failed `@unique` task whose key is already queued again.
+
+## Rate limits
+
+`@rate_limit` limits a task across all workers:
+
+```python
+from django.tasks import task
+from werker.decorators import rate_limit
+
+@rate_limit(rate="100/m")  # token bucket: bursts of up to 100, refilled over the minute
+@task
+def call_partner_api(order_id: int) -> None:
+    ...
+
+@rate_limit(concurrency=2)  # at most 2 running at once
+@task
+def render_pdf(document_id: int) -> None:
+    ...
+
+@rate_limit(rate="10/s", burst=1, concurrency=4)  # combined; burst=1 spreads runs evenly
+@task
+def send_sms(message_id: int) -> None:
+    ...
+```
+
+- `rate` accepts `/s`, `/m` and `/h`. `burst` defaults to the count in `rate`.
+- Limits are checked when a worker claims work. A task held back by its limit stays READY and doesn't use up an attempt; the worker comes back when the next token is due.
+- Each limited task has a small row in the `RateLimitBucket` table, locked briefly while claiming.
+- Limited tasks are claimed before other tasks in each batch, so `priority` only orders tasks within the same group.
+
+## Timeouts
+
+Set a time limit for one task with `@timeout`, or for all tasks with the `TASK_TIMEOUT` option. An attempt that runs longer fails with `werker.exceptions.TaskTimeout` and is retried like any other failure:
+
+```python
+from django.tasks import task
+from werker.decorators import timeout
+
+@timeout(30)
+@task
+def render_report(report_id: int) -> None:
+    ...
+```
+
+- **Async tasks** are cancelled cleanly at the deadline.
+- **Sync tasks** run in a thread, and Python can't kill a thread. The attempt is recorded as failed, but the thread keeps running until the function returns. It keeps its worker slot until then, so the worker claims less new work. A retry can overlap with the abandoned thread, so sync tasks with a timeout must be idempotent.
+- **At-most-once tasks** are never retried after a timeout, because the first attempt may still be running.
 
 ## Periodic schedules
 
@@ -180,7 +304,34 @@ With `catchup=False` (the default), fully missed occurrences are skipped and the
 
 Task rows contain arguments, results, recorded errors, lifecycle timestamps, claim ownership, and attempt history. Django admin registers task results as read-only and exposes periodic tasks for operational inspection. Treat both as sensitive operational data and restrict admin access accordingly.
 
-Prune old terminal results on a regular schedule. READY and RUNNING rows are never deleted by this command:
+### Cancel and requeue
+
+```python
+from werker.api import cancel, requeue  # async: acancel, arequeue
+
+cancel(result.id)   # False if the task had already finished
+requeue(result.id)  # FAILED tasks only; False otherwise
+```
+
+Django's task API has no "cancelled" status, so a cancelled task becomes FAILED with a `werker.exceptions.TaskCancelled` error.
+
+- **READY** tasks are cancelled immediately and never run.
+- **RUNNING** tasks are cancelled at the worker's next heartbeat (`HEARTBEAT_INTERVAL`). An async task is interrupted. A sync task can't be interrupted: it runs to the end and keeps its result, but is never retried.
+- **Requeue** runs a FAILED task again now, with a fresh retry budget (`reset_attempts=False` keeps the old count). Its error history is kept.
+
+The task result admin has "Cancel selected tasks" and "Requeue selected failed tasks" actions.
+
+### Retention
+
+Finished task rows are kept until you delete them. Set `RESULT_TTL` to let the workers do it:
+
+```python
+"OPTIONS": {"RESULT_TTL": {"SUCCESSFUL": "7d", "FAILED": "30d"}}
+```
+
+Every `CLEANUP_INTERVAL`, one worker (a Postgres advisory lock makes sure it's only one) deletes SUCCESSFUL and FAILED rows whose `finished_at` is older than their TTL, in batches. Leave a status out to keep those rows. READY and RUNNING rows are never deleted. The same pass forgets worker records not seen for 7 days.
+
+To prune by hand or from your own scheduler instead, use the management command. READY and RUNNING rows are never deleted by it either:
 
 ```bash
 python manage.py prune_task_results --older-than=30d      # default retention

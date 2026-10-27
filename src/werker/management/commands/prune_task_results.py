@@ -12,29 +12,18 @@ keep each statement cheap on large tables.
 from datetime import timedelta
 from typing import Any
 
-from django.core.management.base import BaseCommand, CommandParser
-from django.db.models import QuerySet
+from django.core.management.base import BaseCommand, CommandError, CommandParser
 from django.utils import timezone
 
-from werker.models import DBTaskResult, TaskStatus
+from werker.maintenance import (
+    DEFAULT_BATCH_SIZE,
+    TERMINAL_STATUSES,
+    parse_duration,
+    prunable,
+    prune_results,
+)
 
-DEFAULT_RETENTION_HOURS = 24 * 30  # 30 days
-DEFAULT_BATCH_SIZE = 1000
-TERMINAL_STATUSES = (TaskStatus.SUCCESSFUL, TaskStatus.FAILED)
-
-
-def parse_duration(value: str) -> timedelta:
-    """Parses e.g. '30d', '12h', '90m', '60s', or a bare integer of hours."""
-    value = value.strip().lower()
-    if value.endswith("d"):
-        return timedelta(days=int(value[:-1]))
-    if value.endswith("h"):
-        return timedelta(hours=int(value[:-1]))
-    if value.endswith("m"):
-        return timedelta(minutes=int(value[:-1]))
-    if value.endswith("s"):
-        return timedelta(seconds=int(value[:-1]))
-    return timedelta(hours=int(value))
+DEFAULT_RETENTION = timedelta(days=30)
 
 
 class Command(BaseCommand):
@@ -71,15 +60,19 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args: Any, **options: Any) -> None:
-        retention = (
-            parse_duration(options["older_than"])
-            if options["older_than"]
-            else timedelta(hours=DEFAULT_RETENTION_HOURS)
-        )
-        cutoff = timezone.now() - retention
-
-        statuses = self._normalize_statuses(options["status"])
-        queryset = self._build_queryset(cutoff, statuses)
+        try:
+            retention = (
+                parse_duration(options["older_than"])
+                if options["older_than"]
+                else DEFAULT_RETENTION
+            )
+            statuses = (
+                options["status"].split(",") if options["status"] else list(TERMINAL_STATUSES)
+            )
+            cutoff = timezone.now() - retention
+            queryset = prunable(cutoff, statuses)
+        except ValueError as exc:
+            raise CommandError(str(exc)) from exc
 
         if options["dry_run"]:
             count = queryset.count()
@@ -88,36 +81,9 @@ class Command(BaseCommand):
             )
             return
 
-        total = self._delete_in_batches(queryset, options["batch_size"])
+        total = prune_results(cutoff, statuses, batch_size=options["batch_size"])
         self.stdout.write(
             self.style.SUCCESS(
                 f"pruned {total} row(s) older than {retention} (cutoff {cutoff.isoformat()})."
             )
         )
-
-    def _normalize_statuses(self, raw: str | None) -> tuple[str, ...]:
-        if not raw:
-            return TERMINAL_STATUSES
-        wanted = [s.strip().upper() for s in raw.split(",") if s.strip()]
-        for status in wanted:
-            if status not in TaskStatus.values:
-                raise ValueError(
-                    f"Unknown status {status!r}; choose from {', '.join(TaskStatus.values)}."
-                )
-        return tuple(wanted)
-
-    def _build_queryset(self, cutoff: Any, statuses: tuple[str, ...]) -> QuerySet[DBTaskResult]:
-        return DBTaskResult.objects.filter(
-            status__in=statuses,
-            finished_at__isnull=False,
-            finished_at__lt=cutoff,
-        )
-
-    def _delete_in_batches(self, queryset: QuerySet[DBTaskResult], batch_size: int) -> int:
-        total = 0
-        while True:
-            ids = list(queryset.values_list("id", flat=True)[:batch_size])
-            if not ids:
-                return total
-            deleted, _ = DBTaskResult.objects.filter(id__in=ids).delete()
-            total += deleted

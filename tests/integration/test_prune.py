@@ -4,9 +4,10 @@ from datetime import timedelta
 
 import pytest
 from django.core.management import call_command
+from django.core.management.base import CommandError
 from django.utils import timezone
 
-from werker.management.commands.prune_task_results import parse_duration
+from werker.maintenance import parse_duration
 from werker.models import DBTaskResult, TaskStatus
 from werker.worker.autostart import _is_runserver
 
@@ -127,9 +128,10 @@ def test_prune_status_filter_only_deletes_requested_status():
 
 
 @pytest.mark.django_db(transaction=True)
-def test_prune_rejects_unknown_status():
-    with pytest.raises(ValueError, match="Unknown status"):
-        call_command("prune_task_results", older_than="30d", status="bogus", verbosity=0)
+@pytest.mark.parametrize("status", ["bogus", "ready", "running"])
+def test_prune_rejects_non_terminal_status(status):
+    with pytest.raises(CommandError, match="Can't prune status"):
+        call_command("prune_task_results", older_than="30d", status=status, verbosity=0)
 
 
 @pytest.mark.django_db(transaction=True)

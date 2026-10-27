@@ -14,6 +14,10 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Python 3.12+ is required (Django 6 does not support 3.11).
 
 ### Fixed
+- `prune_task_results` raises `CommandError` (exit code 1) for a bad
+  `--status`, and refuses READY and RUNNING.
+- A failing heartbeat query no longer stops the task's heartbeats, which
+  let the reaper reclaim a task that was still running.
 - runserver autostart crashed at startup because signal handlers can't be
   installed off the main thread. It also only starts in the autoreloader's
   child process now, so runserver runs one worker instead of two.
@@ -24,6 +28,28 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reclaims it.
 
 ### Added
+- `@retry` decorator: per-task retry budget, exception filter (`on=`) and
+  backoff settings.
+- `RETRY_JITTER` option (default on) that randomises retry delays.
+- LISTEN/NOTIFY wakeups: idle workers pick up a newly enqueued task at
+  once instead of at the next poll (`LISTEN_NOTIFY`, `LISTEN_DATABASE`).
+  A finished task also wakes the claim loop.
+- `@unique` decorator: enqueueing a task whose key is already READY or
+  RUNNING returns the existing result instead of adding a duplicate.
+- Automatic result cleanup with the `RESULT_TTL` and `CLEANUP_INTERVAL`
+  options; one worker at a time prunes, guarded by an advisory lock.
+- `@rate_limit(rate=..., burst=..., concurrency=...)`: cluster-wide rate
+  and concurrency limits per task, enforced at claim time.
+- Worker presence: a `WorkerRecord` row per worker (listed in the admin),
+  `taskworker --health-file`, and a `werker_health` command for liveness
+  and readiness probes.
+- `werker.api.cancel` / `requeue` (and async `acancel` / `arequeue`), plus
+  matching admin actions. A cancelled task is FAILED with a
+  `werker.exceptions.TaskCancelled` error.
+- `@timeout` decorator and `TASK_TIMEOUT` option: an attempt that runs too
+  long fails with `werker.exceptions.TaskTimeout`.
+- The reaper now delays a reclaimed task with the same exponential backoff
+  as a failed one, instead of a flat `RETRY_BACKOFF_BASE` seconds.
 - `postgres` extra that installs `psycopg[binary]`.
 - Initial Postgres-backed Django task backend, worker, result storage, retry
   handling, periodic schedules, and operational management commands.
