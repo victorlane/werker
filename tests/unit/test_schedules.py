@@ -7,6 +7,7 @@ functions).
 """
 
 from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfoNotFoundError
 
 import pytest
 
@@ -71,6 +72,11 @@ def test_schedule_rejects_both_and_neither():
 def test_schedule_rejects_invalid_cron():
     with pytest.raises(ValueError):
         schedule(cron="not a cron expression")
+
+
+def test_schedule_rejects_unknown_timezone():
+    with pytest.raises(ZoneInfoNotFoundError):
+        schedule(every=60, timezone="Mars/Olympus_Mons")
 
 
 def test_interval_next_fire_is_strictly_after_fire():

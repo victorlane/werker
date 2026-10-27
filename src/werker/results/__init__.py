@@ -23,6 +23,7 @@ from werker.concurrency import (
     get_option,
     run_with_connection_cleanup,
 )
+from werker.config import validate_options
 from werker.models import DBTaskResult, DeliveryGuarantee
 
 _P = ParamSpec("_P")
@@ -31,6 +32,7 @@ _R = TypeVar("_R")
 
 class ResultStore(abc.ABC):
     def __init__(self, options: Any):
+        validate_options(options)
         self.options = options
         concurrency = get_option(
             options, "BOOKKEEPING_CONCURRENCY", DEFAULT_BOOKKEEPING_CONCURRENCY
@@ -63,22 +65,43 @@ class ResultStore(abc.ABC):
         await self._run_sync(self.create, **kwargs)
 
     @abc.abstractmethod
-    def mark_running(self, id: str, *, worker_id: str, attempt: int) -> None: ...
+    def mark_running(self, id: str, *, worker_id: str, attempt: int) -> bool: ...
 
-    async def amark_running(self, id: str, *, worker_id: str, attempt: int) -> None:
-        await self._run_sync(self.mark_running, id, worker_id=worker_id, attempt=attempt)
-
-    @abc.abstractmethod
-    def mark_successful(self, id: str, *, return_value: Any) -> None: ...
-
-    async def amark_successful(self, id: str, *, return_value: Any) -> None:
-        await self._run_sync(self.mark_successful, id, return_value=return_value)
+    async def amark_running(self, id: str, *, worker_id: str, attempt: int) -> bool:
+        return await self._run_sync(self.mark_running, id, worker_id=worker_id, attempt=attempt)
 
     @abc.abstractmethod
-    def mark_failed(self, id: str, *, error: dict[str, str], will_retry: bool) -> None: ...
+    def mark_successful(
+        self, id: str, *, worker_id: str, attempt: int, return_value: Any
+    ) -> bool: ...
 
-    async def amark_failed(self, id: str, *, error: dict[str, str], will_retry: bool) -> None:
-        await self._run_sync(self.mark_failed, id, error=error, will_retry=will_retry)
+    async def amark_successful(
+        self, id: str, *, worker_id: str, attempt: int, return_value: Any
+    ) -> bool:
+        return await self._run_sync(
+            self.mark_successful,
+            id,
+            worker_id=worker_id,
+            attempt=attempt,
+            return_value=return_value,
+        )
+
+    @abc.abstractmethod
+    def mark_failed(
+        self, id: str, *, worker_id: str, attempt: int, error: dict[str, str], will_retry: bool
+    ) -> bool: ...
+
+    async def amark_failed(
+        self, id: str, *, worker_id: str, attempt: int, error: dict[str, str], will_retry: bool
+    ) -> bool:
+        return await self._run_sync(
+            self.mark_failed,
+            id,
+            worker_id=worker_id,
+            attempt=attempt,
+            error=error,
+            will_retry=will_retry,
+        )
 
     @abc.abstractmethod
     def get(self, id: str) -> DBTaskResult: ...

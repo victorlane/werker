@@ -26,6 +26,7 @@ def test_is_runserver_false_by_default(monkeypatch):
 
 def test_is_runserver_true_for_runserver(monkeypatch):
     monkeypatch.setattr("sys.argv", ["manage.py", "runserver"])
+    monkeypatch.setenv("RUN_MAIN", "true")
     assert _is_runserver() is True
 
 

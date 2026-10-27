@@ -7,10 +7,6 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from django.db import close_old_connections
-from typing_extensions import ParamSpec, TypeVar
-
-_P = ParamSpec("_P")
-_R = TypeVar("_R")
 
 #: Default size for a Broker/ResultStore's dedicated bookkeeping executor.
 #: Configurable via OPTIONS["BOOKKEEPING_CONCURRENCY"].
@@ -21,7 +17,9 @@ def create_bounded_executor(size: int, thread_name_prefix: str) -> ThreadPoolExe
     return ThreadPoolExecutor(max_workers=size, thread_name_prefix=thread_name_prefix)
 
 
-def run_with_connection_cleanup(func: Callable[_P, _R], *args: _P.args, **kwargs: _P.kwargs) -> _R:
+def run_with_connection_cleanup[**P, R](
+    func: Callable[P, R], *args: P.args, **kwargs: P.kwargs
+) -> R:
     try:
         return func(*args, **kwargs)
     finally:

@@ -51,7 +51,7 @@ def test_at_least_once_with_retries_remaining_is_retried():
 @pytest.mark.django_db(transaction=True)
 def test_at_least_once_with_retries_exhausted_is_failed():
     row = _stale_running_row(
-        delivery_guarantee=DeliveryGuarantee.AT_LEAST_ONCE, attempts=3, max_retries=3
+        delivery_guarantee=DeliveryGuarantee.AT_LEAST_ONCE, attempts=4, max_retries=3
     )
 
     broker = PostgresBroker(options=None)

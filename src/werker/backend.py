@@ -29,6 +29,7 @@ from typing_extensions import ParamSpec, TypeVar
 
 from werker import registry
 from werker.broker import QueueItem
+from werker.config import validate_options
 from werker.models import DBTaskResult, TaskStatus
 from werker.schedules.registry import ScheduleDeclaration
 
@@ -48,6 +49,7 @@ class PostgresTaskBackend(BaseTaskBackend):
 
     def __init__(self, alias: str, params: dict[str, Any]) -> None:
         super().__init__(alias, params)
+        validate_options(self.options)
         broker_cls = import_string(self.options.get("BROKER_CLASS", DEFAULT_BROKER_CLASS))
         result_store_cls = import_string(
             self.options.get("RESULT_STORE_CLASS", DEFAULT_RESULT_STORE_CLASS)
