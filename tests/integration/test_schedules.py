@@ -8,13 +8,16 @@ The scheduled tasks are module-level (django.tasks refuses nested
 functions), so the declarations below register at import time.
 """
 
+import asyncio
 import threading
 from datetime import timedelta
 
 import pytest
+from asgiref.sync import sync_to_async
 from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.tasks import task
+from django.test import override_settings
 from django.utils import timezone
 
 from werker.broker.postgres import PostgresBroker
@@ -22,7 +25,7 @@ from werker.models import DBTaskResult, PeriodicTask, ScheduleKind, TaskStatus
 from werker.schedules.decorators import schedule
 from werker.schedules.registry import ScheduleDeclaration, clear, register
 from werker.worker.core import Worker
-from werker.worker.scheduler import _dispatch, _dispatch_sync
+from werker.worker.scheduler import _dispatch, _dispatch_sync, scheduler_loop
 
 
 @schedule(every=3600, name="integration-every-hour")
@@ -225,3 +228,41 @@ async def test_dispatch_does_not_compete_with_sync_tasks_for_threads(monkeypatch
     await _dispatch(Worker(), "any-id")
 
     assert thread_names[0].startswith("werker-broker")
+
+
+@pytest.mark.django_db(transaction=True)
+def test_syncschedules_updates_a_changed_declaration_and_reschedules_it():
+    call_command("syncschedules", verbosity=0)
+    schedule(every=7200, name="integration-every-hour")(periodic_thing)
+
+    call_command("syncschedules", verbosity=0)
+
+    pt = PeriodicTask.objects.get(name="integration-every-hour")
+    assert pt.interval_seconds == 7200
+    assert pt.next_run_at > timezone.now() + timedelta(seconds=3600)
+
+
+@pytest.mark.django_db(transaction=True)
+async def test_scheduler_loop_fires_a_due_schedule():
+    fast_scheduler = {
+        "default": {
+            "BACKEND": "werker.backend.PostgresTaskBackend",
+            "OPTIONS": {"SCHEDULER_POLL_INTERVAL": 0.01},
+        }
+    }
+    await sync_to_async(call_command)("syncschedules", verbosity=0)
+    await PeriodicTask.objects.filter(name="integration-every-hour").aupdate(
+        next_run_at=timezone.now() - timedelta(seconds=1)
+    )
+    fired = DBTaskResult.objects.filter(task_path=periodic_thing.module_path)
+
+    with override_settings(TASKS=fast_scheduler):
+        worker = Worker()
+        loop_task = asyncio.ensure_future(scheduler_loop(worker))
+        async with asyncio.timeout(5):
+            while not await fired.aexists():
+                await asyncio.sleep(0.01)
+        worker._shutdown.set()
+        await loop_task
+
+    assert await fired.acount() == 1

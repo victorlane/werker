@@ -99,3 +99,17 @@ def test_cron_next_fire_uses_expression():
     fired = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
     nxt = next_run_after_fire(task_row, fired)
     assert nxt == datetime(2026, 1, 2, 0, 0, 0, tzinfo=UTC)
+
+
+def test_cron_next_fire_keeps_local_time_across_dst():
+    task_row = PeriodicTask(
+        schedule_kind=ScheduleKind.CRON,
+        cron_expression="0 9 * * *",
+        timezone="Europe/Amsterdam",
+    )
+    # 09:00 CET on the day before clocks spring forward to CEST.
+    fired_at = datetime(2026, 3, 28, 8, 0, tzinfo=UTC)
+
+    next_fire = next_run_after_fire(task_row, fired_at)
+
+    assert next_fire == datetime(2026, 3, 29, 7, 0, tzinfo=UTC)
