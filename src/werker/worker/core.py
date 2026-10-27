@@ -17,6 +17,7 @@ import logging
 import os
 import signal
 import socket
+import time
 import traceback
 import uuid
 from collections.abc import Awaitable, Callable, Coroutine, Mapping
@@ -27,7 +28,7 @@ from typing import Any
 from django.core.exceptions import ImproperlyConfigured
 from django.db import router
 from django.tasks import task_backends
-from django.tasks.base import TaskContext
+from django.tasks.base import TaskContext, TaskResultStatus
 from django.tasks.signals import task_finished, task_started
 from django.utils import timezone
 from django.utils.json import normalize_json
@@ -79,6 +80,32 @@ def _needs_thread(task_path: str) -> bool:
     except ImportError:
         return False
     return not iscoroutinefunction(task.func)
+
+
+def _log_finished(
+    item: ClaimedItem, worker_id: str, status: str, duration_seconds: float
+) -> None:
+    """One line per finished attempt, WARNING unless it succeeded (READY
+    means it failed and will be retried). The `extra` fields are there for
+    structured log handlers (JSON, Loki, ...) to index on."""
+    duration_ms = round(duration_seconds * 1000)
+    logger.log(
+        logging.INFO if status == TaskResultStatus.SUCCESSFUL else logging.WARNING,
+        "werker task %s id=%s attempt=%d %s in %dms",
+        item.task_path,
+        item.id,
+        item.attempt,
+        status,
+        duration_ms,
+        extra={
+            "task_path": item.task_path,
+            "task_id": item.id,
+            "attempt": item.attempt,
+            "worker_id": worker_id,
+            "status": status,
+            "duration_ms": duration_ms,
+        },
+    )
 
 
 class Worker:
@@ -390,6 +417,7 @@ class Worker:
         task = result.task
 
         task_started.send(sender=type(self.backend), task_result=result)
+        started_at = time.monotonic()
 
         call_args = (
             (TaskContext(task_result=result), *result.args)
@@ -467,6 +495,9 @@ class Worker:
             self._cancel_requested.discard(item.id)
 
         finished_result = await self.backend.aget_result(item.id)
+        _log_finished(
+            item, self.worker_id, finished_result.status, time.monotonic() - started_at
+        )
         task_finished.send(sender=type(self.backend), task_result=finished_result)
 
     def _timeout_for(self, task_path: str) -> float | None:

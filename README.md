@@ -127,7 +127,7 @@ Put options under `TASKS[alias]["OPTIONS"]`. All numeric options are validated w
 
 | Option | Default | Meaning |
 | --- | ---: | --- |
-| `CONCURRENCY` | `8` | Maximum synchronous `def` task executions, backed by a thread pool. |
+| `CONCURRENCY` | `8` | Maximum synchronous `def` task executions, backed by a thread pool. A worker never starts more sync tasks than it has free threads; extra claims go straight back to the queue for other workers. |
 | `MAX_ASYNC_CONCURRENCY` | `200` | Maximum native `async def` task executions. |
 | `CLAIM_BATCH_SIZE` | `10` | Maximum rows claimed in one queue, reaper, or scheduler operation. |
 | `POLL_INTERVAL` | `1.0` seconds | Delay before polling for more ready work. |
@@ -344,7 +344,16 @@ Durations support `d`, `h`, `m`, `s`, or bare hours (`30d`, `12h`, `90m`, `60s`,
 
 ## Observability and troubleshooting
 
-The `werker.worker` logger records worker lifecycle, stale-claim reclamation, schedule dispatches, and scheduler exceptions. Send it to your normal structured logging/alerting pipeline. Monitor worker availability, queue age, READY/RUNNING counts, FAILED counts, retries, stale reclaims, scheduler dispatch failures, and database connection saturation.
+The `werker.worker` logger records worker lifecycle, stale-claim reclamation, schedule dispatches, and scheduler exceptions. Send it to your normal structured logging/alerting pipeline. Each finished attempt logs one line (INFO if it succeeded, WARNING otherwise) carrying `task_path`, `task_id`, `attempt`, `worker_id`, `status` and `duration_ms` as structured `extra` fields.
+
+For queue health, `werker_stats` reports per queue the due, deferred, running and stale-running counts plus the age of the oldest waiting task, in one query over the claim index:
+
+```bash
+python manage.py werker_stats          # table
+python manage.py werker_stats --json   # for a cron job or exporter
+```
+
+Alert when `oldest_ready_age_seconds` keeps growing (workers can't keep up or are down) or `stale_running` is non-zero (workers are dying mid-task). Monitor worker availability, queue age, READY/RUNNING counts, FAILED counts, retries, stale reclaims, scheduler dispatch failures, and database connection saturation.
 
 If work is not running, check: migrations are applied; a `taskworker` is alive; the selected backend alias and queues match the task; `run_after` is due; and workers can reach PostgreSQL. If scheduled work is absent, run `syncschedules --all` after verifying task-module imports and inspect the corresponding `PeriodicTask` row in admin. Do not manually change claim fields while a worker is running; restart workers or allow stale leases to recover.
 
