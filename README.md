@@ -6,10 +6,10 @@ Werker is a self-contained, PostgreSQL-backed task queue and periodic scheduler 
 
 ## Install and configure
 
-Werker requires Python 3.11+, Django 6.0+, and PostgreSQL. Install it and add the application plus Django task backend configuration:
+Werker requires Python 3.12+, Django 6.0+, and PostgreSQL. Install it and add the application plus Django task backend configuration:
 
 ```bash
-python -m pip install werker
+python -m pip install 'werker[postgres]'
 ```
 
 ```python

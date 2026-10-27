@@ -6,7 +6,25 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- `MAX_RETRIES` now counts retries, as documented: `MAX_RETRIES=n` allows
+  `n + 1` attempts. Previously it allowed `n` attempts in total. The worker
+  now uses the retry budget stored on each task row instead of the current
+  setting.
+- Python 3.12+ is required (Django 6 does not support 3.11).
+
+### Fixed
+- runserver autostart crashed at startup because signal handlers can't be
+  installed off the main thread. It also only starts in the autoreloader's
+  child process now, so runserver runs one worker instead of two.
+- A transient database error in the claim or reaper loop no longer stops the
+  worker.
+- A task that can no longer be imported, or that raises `SystemExit`, is
+  recorded as a failed attempt instead of staying RUNNING until the reaper
+  reclaims it.
+
 ### Added
+- `postgres` extra that installs `psycopg[binary]`.
 - Initial Postgres-backed Django task backend, worker, result storage, retry
   handling, periodic schedules, and operational management commands.
 - Packaging metadata, contributor and security guidance, and continuous

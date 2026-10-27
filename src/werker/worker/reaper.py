@@ -27,11 +27,16 @@ async def reaper_loop(worker: "Worker") -> None:
             break
 
         stale_before = timezone.now() - timedelta(seconds=worker.stale_running_timeout)
-        reclaimed = await worker.backend.broker.areclaim_stale(
-            stale_before=stale_before,
-            limit=worker.claim_batch_size,
-            retry_backoff_seconds=worker.retry_backoff_base,
-        )
+        try:
+            reclaimed = await worker.backend.broker.areclaim_stale(
+                stale_before=stale_before,
+                limit=worker.claim_batch_size,
+                retry_backoff_seconds=worker.retry_backoff_base,
+            )
+        except Exception:
+            # A transient DB error must not kill the worker; retry next poll.
+            logger.exception("werker reaper %s reclaim failed, retrying", worker.worker_id)
+            continue
         for item in reclaimed:
             logger.warning(
                 "werker reaper %s reclaimed stale claim id=%s action=%s",

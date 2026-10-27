@@ -13,7 +13,7 @@ from django.db.models import F, Q
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 
-from werker.broker import Broker, ClaimedItem, QueueItem, ReclaimedItem
+from werker.broker import Broker, ClaimedItem, QueueItem, ReclaimedItem, retries_remaining
 from werker.models import DBTaskResult, DeliveryGuarantee, PeriodicTask, TaskStatus
 
 
@@ -57,9 +57,16 @@ class PostgresBroker(Broker):
                 last_attempted_at=now,
                 attempts=F("attempts") + 1,
             )
-        rows = DBTaskResult.objects.filter(id__in=ids).values("id", "queue_name", "attempts")
+        rows = DBTaskResult.objects.filter(id__in=ids).values(
+            "id", "queue_name", "attempts", "max_retries"
+        )
         return [
-            ClaimedItem(id=str(row["id"]), queue_name=row["queue_name"], attempt=row["attempts"])
+            ClaimedItem(
+                id=str(row["id"]),
+                queue_name=row["queue_name"],
+                attempt=row["attempts"],
+                max_retries=row["max_retries"],
+            )
             for row in rows
         ]
 
@@ -113,7 +120,7 @@ class PostgresBroker(Broker):
             for row in rows:
                 can_retry = (
                     row["delivery_guarantee"] == DeliveryGuarantee.AT_LEAST_ONCE
-                    and row["attempts"] < row["max_retries"]
+                    and retries_remaining(row["attempts"], row["max_retries"])
                 )
                 if can_retry:
                     retry_ids.append(row["id"])

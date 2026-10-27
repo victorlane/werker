@@ -30,7 +30,7 @@ from django.utils import timezone
 from django.utils.json import normalize_json
 
 from werker.backend import PostgresTaskBackend
-from werker.broker import ClaimedItem
+from werker.broker import ClaimedItem, retries_remaining
 from werker.config import validate_options
 from werker.worker.executor import create_executor, run_with_connection_cleanup
 from werker.worker.reaper import reaper_loop
@@ -42,7 +42,6 @@ DEFAULT_CONCURRENCY = 8
 DEFAULT_MAX_ASYNC_CONCURRENCY = 200
 DEFAULT_POLL_INTERVAL = 1.0
 DEFAULT_CLAIM_BATCH_SIZE = 10
-DEFAULT_MAX_RETRIES = 3
 DEFAULT_RETRY_BACKOFF_BASE = 2.0
 DEFAULT_RETRY_BACKOFF_MAX = 300
 DEFAULT_HEARTBEAT_INTERVAL = 15
@@ -80,7 +79,6 @@ class Worker:
         )
         self.poll_interval: float = options.get("POLL_INTERVAL", DEFAULT_POLL_INTERVAL)
         self.claim_batch_size: int = options.get("CLAIM_BATCH_SIZE", DEFAULT_CLAIM_BATCH_SIZE)
-        self.max_retries: int = options.get("MAX_RETRIES", DEFAULT_MAX_RETRIES)
         self.retry_backoff_base: float = options.get(
             "RETRY_BACKOFF_BASE", DEFAULT_RETRY_BACKOFF_BASE
         )
@@ -162,9 +160,16 @@ class Worker:
                 continue
 
             limit = min(capacity, self.claim_batch_size)
-            claimed = await self.backend.broker.aclaim(
-                queue_names=self.queues, limit=limit, worker_id=self.worker_id
-            )
+            try:
+                claimed = await self.backend.broker.aclaim(
+                    queue_names=self.queues, limit=limit, worker_id=self.worker_id
+                )
+            except Exception:
+                # A transient DB error (e.g. Postgres restart) must not kill
+                # the worker; back off and retry next poll.
+                logger.exception("werker worker %s claim failed, retrying", self.worker_id)
+                await self._wait_or_shutdown(self.poll_interval)
+                continue
 
             if not claimed:
                 if self.once:
@@ -202,7 +207,32 @@ class Worker:
                 t.cancel()
 
     async def _execute(self, item: ClaimedItem) -> None:
-        result = await self.backend.aget_result(item.id)
+        """Runs one claimed item. Nobody awaits this future, so every error
+        must be handled here or it would vanish and leave the row RUNNING
+        until the reaper notices."""
+        try:
+            await self._run_claimed(item)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "werker worker %s failed handling task %s attempt %s",
+                self.worker_id,
+                item.id,
+                item.attempt,
+            )
+
+    async def _run_claimed(self, item: ClaimedItem) -> None:
+        try:
+            result = await self.backend.aget_result(item.id)
+        except Exception as exc:
+            # e.g. the task's module or function no longer exists. Record it
+            # on the row like any other failed attempt.
+            logger.exception(
+                "werker worker %s could not load task %s", self.worker_id, item.id
+            )
+            await self._handle_failure(item, exc)
+            return
         task = result.task
 
         owns_claim = await self.backend.result_store.amark_running(
@@ -237,8 +267,12 @@ class Worker:
                         run_with_connection_cleanup, task.func, *call_args, **result.kwargs
                     ),
                 )
-        except Exception as exc:
-            # Deliberately catch-all: any task exception is a failed attempt,
+        except asyncio.CancelledError:
+            # Shutdown abandoned this task; the reaper reclaims it.
+            raise
+        except BaseException as exc:
+            # Deliberately catch-all, including SystemExit/KeyboardInterrupt
+            # raised by task code: any task exception is a failed attempt,
             # not a worker bug.
             await self._handle_failure(item, exc)
         else:
@@ -269,7 +303,7 @@ class Worker:
 
     async def _heartbeat_sender(self, item: ClaimedItem) -> None:
         """Keeps this exact claim attempt's heartbeat fresh. Cancelled as soon
-        as execution finishes, see _execute's finally block."""
+        as execution finishes, see _run_claimed's finally block."""
         while True:
             await asyncio.sleep(self.heartbeat_interval)
             await self.backend.broker.aheartbeat(
@@ -282,7 +316,7 @@ class Worker:
             "exception_class_path": f"{exception_type.__module__}.{exception_type.__qualname__}",
             "traceback": "".join(traceback.format_exception(exc)),
         }
-        will_retry = item.attempt < self.max_retries
+        will_retry = retries_remaining(item.attempt, item.max_retries)
         owns_claim = await self.backend.result_store.amark_failed(
             item.id,
             worker_id=self.worker_id,

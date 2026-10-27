@@ -43,11 +43,21 @@ class QueueItem:
     run_after: datetime
 
 
+def retries_remaining(attempt: int, max_retries: int) -> bool:
+    """True if a task that just finished attempt number `attempt` (1-based)
+    may run again. MAX_RETRIES counts retries, so MAX_RETRIES=n allows n+1
+    attempts in total and 0 disables retries."""
+    return attempt <= max_retries
+
+
 @dataclass(frozen=True)
 class ClaimedItem:
     id: str
     queue_name: str
     attempt: int
+    #: Retry budget stored on the row at enqueue time, so a settings change
+    #: doesn't alter tasks already in the queue.
+    max_retries: int
 
 
 @dataclass(frozen=True)
