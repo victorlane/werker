@@ -26,8 +26,33 @@ def test_does_not_start_when_disabled(monkeypatch):
     assert AutostartManager._thread is None
 
 
+def test_does_not_start_in_autoreloader_parent(monkeypatch):
+    # The parent only watches files; the RUN_MAIN child serves requests.
+    monkeypatch.setattr("sys.argv", ["manage.py", "runserver"])
+    monkeypatch.delenv("RUN_MAIN", raising=False)
+    assert AutostartManager.start_if_requested() is False
+    assert AutostartManager._thread is None
+
+
+def test_starts_under_noreload(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["manage.py", "runserver", "--noreload"])
+    monkeypatch.delenv("RUN_MAIN", raising=False)
+
+    class FakeWorker:
+        async def run(self):
+            pass
+
+        def request_shutdown(self):
+            pass
+
+    monkeypatch.setattr("werker.worker.core.Worker", FakeWorker)
+
+    assert AutostartManager.start_if_requested() is True
+
+
 def test_starts_worker_thread_when_runserver_and_enabled(monkeypatch):
     monkeypatch.setattr("sys.argv", ["manage.py", "runserver"])
+    monkeypatch.setenv("RUN_MAIN", "true")
 
     started = {}
 
@@ -37,6 +62,9 @@ def test_starts_worker_thread_when_runserver_and_enabled(monkeypatch):
 
         async def run(self):
             started["ran"] = True
+
+        def request_shutdown(self):
+            pass
 
     # Worker is imported lazily inside start_if_requested from core.
     monkeypatch.setattr("werker.worker.core.Worker", FakeWorker)
@@ -49,9 +77,13 @@ def test_starts_worker_thread_when_runserver_and_enabled(monkeypatch):
 
 def test_is_idempotent_within_one_process(monkeypatch):
     monkeypatch.setattr("sys.argv", ["manage.py", "runserver"])
+    monkeypatch.setenv("RUN_MAIN", "true")
 
     class FakeWorker:
         async def run(self):
+            pass
+
+        def request_shutdown(self):
             pass
 
     monkeypatch.setattr("werker.worker.core.Worker", FakeWorker)

@@ -130,13 +130,20 @@ class Worker:
             self._executor.shutdown(wait=False, cancel_futures=True)
             logger.info("werker worker %s stopped", self.worker_id)
 
+    def request_shutdown(self) -> None:
+        """Starts a graceful shutdown. Not thread-safe: from another thread,
+        use loop.call_soon_threadsafe(worker.request_shutdown)."""
+        self._shutdown.set()
+
     def _install_signal_handlers(self) -> None:
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
             try:
-                loop.add_signal_handler(sig, self._shutdown.set)
-            except NotImplementedError:
-                # e.g. Windows, or a non-main-thread event loop in tests.
+                loop.add_signal_handler(sig, self.request_shutdown)
+            except (NotImplementedError, RuntimeError, ValueError):
+                # NotImplementedError on Windows. RuntimeError/ValueError when
+                # the loop runs outside the main thread (runserver autostart,
+                # tests): only the main thread may install signal handlers.
                 pass
 
     def _available_capacity(self) -> int:
