@@ -5,23 +5,36 @@ touching only the claim-relevant columns. A future non-Postgres Broker
 would own its own separate storage.
 """
 
-from collections.abc import Sequence
+import math
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
+from typing import Any
 
 from django.db import connections, router, transaction
-from django.db.models import F, Q
+from django.db.models import F, Q, QuerySet
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 
 from werker.broker import (
     Broker,
+    ClaimBatch,
     ClaimedItem,
     QueueItem,
     ReclaimedItem,
     RetryDelay,
     retries_remaining,
 )
-from werker.models import DBTaskResult, DeliveryGuarantee, PeriodicTask, TaskStatus
+from werker.models import (
+    DBTaskResult,
+    DeliveryGuarantee,
+    PeriodicTask,
+    RateLimitBucket,
+    TaskStatus,
+)
+from werker.registry import TaskPolicy
+
+#: How soon to retry a task path held back by its concurrency limit.
+CONCURRENCY_RECHECK_INTERVAL = 1.0
 
 #: Postgres NOTIFY channel; the payload is the queue name.
 NOTIFY_CHANNEL = "werker"
@@ -49,24 +62,58 @@ class PostgresBroker(Broker):
             notify_queue(item.queue_name)
 
     def claim(
-        self, *, queue_names: Sequence[str], limit: int, worker_id: str
-    ) -> list[ClaimedItem]:
+        self,
+        *,
+        queue_names: Sequence[str],
+        limit: int,
+        worker_id: str,
+        limits: Mapping[str, TaskPolicy] | None = None,
+    ) -> ClaimBatch:
         """The core correctness-critical claim query. Also directly callable
-        from a thread pool in tests to exercise real concurrent transactions."""
+        from a thread pool in tests to exercise real concurrent transactions.
+
+        Rate-limited task paths are claimed first, each within its limit;
+        the remaining capacity goes to all other tasks."""
         now = timezone.now()
+        limits = limits or {}
+        batch = ClaimBatch()
         with transaction.atomic():
-            ids = list(
-                DBTaskResult.objects.select_for_update(skip_locked=True)
-                .filter(
-                    status=TaskStatus.READY,
-                    queue_name__in=queue_names,
-                    run_after__lte=now,
-                )
-                .order_by("-priority", "run_after")
-                .values_list("id", flat=True)[:limit]
+            due_filter = Q(
+                status=TaskStatus.READY, queue_name__in=queue_names, run_after__lte=now
             )
+            due = DBTaskResult.objects.select_for_update(skip_locked=True).filter(due_filter)
+            ids: list[Any] = []
+            # Only the limited paths that have due work, in one plain query.
+            waiting_paths = (
+                set(
+                    DBTaskResult.objects.filter(due_filter, task_path__in=list(limits))
+                    .values_list("task_path", flat=True)
+                    .distinct()
+                )
+                if limits
+                else set()
+            )
+            for task_path in sorted(waiting_paths):
+                if len(ids) >= limit:
+                    break
+                limited_ids, wait = self._claim_limited(
+                    due.filter(task_path=task_path),
+                    task_path,
+                    limits[task_path],
+                    limit - len(ids),
+                    now,
+                )
+                ids.extend(limited_ids)
+                if wait is not None:
+                    batch.wait_hint = min(wait, batch.wait_hint or wait)
+            if len(ids) < limit:
+                ids.extend(
+                    due.exclude(task_path__in=list(limits))
+                    .order_by("-priority", "run_after")
+                    .values_list("id", flat=True)[: limit - len(ids)]
+                )
             if not ids:
-                return []
+                return batch
             DBTaskResult.objects.filter(id__in=ids).update(
                 status=TaskStatus.RUNNING,
                 claimed_by=worker_id,
@@ -79,7 +126,7 @@ class PostgresBroker(Broker):
         rows = DBTaskResult.objects.filter(id__in=ids).values(
             "id", "queue_name", "task_path", "attempts", "max_retries"
         )
-        return [
+        batch.extend(
             ClaimedItem(
                 id=str(row["id"]),
                 queue_name=row["queue_name"],
@@ -88,7 +135,68 @@ class PostgresBroker(Broker):
                 max_retries=row["max_retries"],
             )
             for row in rows
-        ]
+        )
+        return batch
+
+    def _claim_limited(
+        self,
+        due: QuerySet[DBTaskResult],
+        task_path: str,
+        policy: TaskPolicy,
+        limit: int,
+        now: datetime,
+    ) -> tuple[list[Any], float | None]:
+        """Picks due ids of one rate-limited task path (which has due work),
+        within its limits.
+        Runs inside claim()'s transaction. Returns (ids, wait hint).
+
+        The path's bucket row is locked with SKIP LOCKED: it serializes the
+        token and running-count checks, and a worker that finds it locked
+        just skips this path for now instead of waiting."""
+        capacity = policy.rate_capacity or 1.0
+        RateLimitBucket.objects.bulk_create(
+            [RateLimitBucket(key=task_path, tokens=capacity, updated_at=now)],
+            ignore_conflicts=True,
+        )
+        bucket = (
+            RateLimitBucket.objects.select_for_update(skip_locked=True)
+            .filter(key=task_path)
+            .first()
+        )
+        if bucket is None:
+            return [], None
+
+        allowed = limit
+        if policy.rate is not None:
+            elapsed = max((now - bucket.updated_at).total_seconds(), 0.0)
+            bucket.tokens = min(capacity, bucket.tokens + elapsed * policy.rate)
+            bucket.updated_at = now
+            allowed = min(allowed, math.floor(bucket.tokens))
+        if policy.concurrency is not None:
+            running = DBTaskResult.objects.filter(
+                task_path=task_path, status=TaskStatus.RUNNING
+            ).count()
+            allowed = min(allowed, policy.concurrency - running)
+
+        ids: list[Any] = []
+        if allowed > 0:
+            ids = list(
+                due.order_by("-priority", "run_after").values_list("id", flat=True)[:allowed]
+            )
+        if policy.rate is not None:
+            bucket.tokens -= len(ids)
+            bucket.save(update_fields=["tokens", "updated_at"])
+
+        wait = None
+        if allowed < limit:
+            # Possibly held back: come back when a token is due, or
+            # (concurrency) after a short poll, since another worker may free
+            # that slot.
+            if policy.rate is not None and bucket.tokens < 1:
+                wait = (1 - bucket.tokens) / policy.rate
+            else:
+                wait = CONCURRENCY_RECHECK_INTERVAL
+        return ids, wait
 
     def ack(self, item_id: str, *, worker_id: str, attempt: int) -> None:
         DBTaskResult.objects.filter(

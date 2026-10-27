@@ -38,6 +38,8 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   RUNNING returns the existing result instead of adding a duplicate.
 - Automatic result cleanup with the `RESULT_TTL` and `CLEANUP_INTERVAL`
   options; one worker at a time prunes, guarded by an advisory lock.
+- `@rate_limit(rate=..., burst=..., concurrency=...)`: cluster-wide rate
+  and concurrency limits per task, enforced at claim time.
 - Worker presence: a `WorkerRecord` row per worker (listed in the admin),
   `taskworker --health-file`, and a `werker_health` command for liveness
   and readiness probes.

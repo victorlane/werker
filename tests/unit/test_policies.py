@@ -75,3 +75,30 @@ def test_task_timeout_option_accepts_none_but_not_zero():
         validate_options({"TASK_TIMEOUT": 0})
     with pytest.raises(ImproperlyConfigured):
         validate_options({"RETRY_JITTER": "yes"})
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {},
+        {"rate": "ten/s"},
+        {"rate": "10/day"},
+        {"rate": "0/s"},
+        {"rate": "5/s", "burst": 0},
+        {"concurrency": 0},
+        {"concurrency": True},
+    ],
+)
+def test_rate_limit_rejects_bad_arguments(kwargs):
+    from werker.decorators import rate_limit
+
+    with pytest.raises(ImproperlyConfigured):
+        rate_limit(**kwargs)
+
+
+def test_parse_rate():
+    from werker.decorators import parse_rate
+
+    assert parse_rate("10/s") == (10, 10)
+    assert parse_rate("120/m") == (2, 120)
+    assert parse_rate("36 / h") == (0.01, 36)

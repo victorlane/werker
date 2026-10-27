@@ -221,6 +221,35 @@ def sync_user(user_id: int, force: bool = False) -> None:
 
 A Postgres partial unique index enforces this, so it also holds for concurrent enqueues from different processes. The `task_enqueued` signal is only sent when a new row is created. A periodic task with `@unique` doesn't pile up when a run takes longer than its interval. `requeue` returns `False` for a failed `@unique` task whose key is already queued again.
 
+## Rate limits
+
+`@rate_limit` limits a task across all workers:
+
+```python
+from django.tasks import task
+from werker.decorators import rate_limit
+
+@rate_limit(rate="100/m")  # token bucket: bursts of up to 100, refilled over the minute
+@task
+def call_partner_api(order_id: int) -> None:
+    ...
+
+@rate_limit(concurrency=2)  # at most 2 running at once
+@task
+def render_pdf(document_id: int) -> None:
+    ...
+
+@rate_limit(rate="10/s", burst=1, concurrency=4)  # combined; burst=1 spreads runs evenly
+@task
+def send_sms(message_id: int) -> None:
+    ...
+```
+
+- `rate` accepts `/s`, `/m` and `/h`. `burst` defaults to the count in `rate`.
+- Limits are checked when a worker claims work. A task held back by its limit stays READY and doesn't use up an attempt; the worker comes back when the next token is due.
+- Each limited task has a small row in the `RateLimitBucket` table, locked briefly while claiming.
+- Limited tasks are claimed before other tasks in each batch, so `priority` only orders tasks within the same group.
+
 ## Timeouts
 
 Set a time limit for one task with `@timeout`, or for all tasks with the `TASK_TIMEOUT` option. An attempt that runs longer fails with `werker.exceptions.TaskTimeout` and is retried like any other failure:

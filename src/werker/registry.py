@@ -49,6 +49,15 @@ def all_policies() -> dict[str, TaskPolicy]:
     return dict(_POLICIES)
 
 
+def limited_policies() -> dict[str, TaskPolicy]:
+    """Task paths with a @rate_limit, for the broker's claim."""
+    return {
+        path: policy
+        for path, policy in _POLICIES.items()
+        if policy.rate is not None or policy.concurrency is not None
+    }
+
+
 def mark_at_most_once(task_path: str) -> None:
     set_policy(task_path, delivery=DeliveryGuarantee.AT_MOST_ONCE)
 

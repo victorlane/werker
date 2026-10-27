@@ -15,7 +15,7 @@ tests/integration/test_broker_claim_concurrency.py for proof this is safe.
 
 import abc
 import functools
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, ClassVar
@@ -30,6 +30,7 @@ from werker.concurrency import (
     run_with_connection_cleanup,
 )
 from werker.config import validate_options
+from werker.registry import TaskPolicy
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
@@ -63,6 +64,14 @@ class ClaimedItem:
     #: Retry budget stored on the row at enqueue time, so a settings change
     #: doesn't alter tasks already in the queue.
     max_retries: int
+
+
+class ClaimBatch(list[ClaimedItem]):
+    """The claimed items. `wait_hint` is set when due work was held back by
+    a rate limit: seconds until it can be claimed, so the worker can come
+    back then instead of after a full poll interval."""
+
+    wait_hint: float | None = None
 
 
 @dataclass(frozen=True)
@@ -99,14 +108,30 @@ class Broker(abc.ABC):
 
     @abc.abstractmethod
     def claim(
-        self, *, queue_names: Sequence[str], limit: int, worker_id: str
-    ) -> list[ClaimedItem]: ...
+        self,
+        *,
+        queue_names: Sequence[str],
+        limit: int,
+        worker_id: str,
+        limits: Mapping[str, TaskPolicy] | None = None,
+    ) -> "ClaimBatch":
+        """Claims up to `limit` due items. `limits` maps task paths to
+        their @rate_limit policy; those tasks are claimed only within it."""
 
     async def aclaim(
-        self, *, queue_names: Sequence[str], limit: int, worker_id: str
-    ) -> list[ClaimedItem]:
+        self,
+        *,
+        queue_names: Sequence[str],
+        limit: int,
+        worker_id: str,
+        limits: Mapping[str, TaskPolicy] | None = None,
+    ) -> "ClaimBatch":
         return await self._run_sync(
-            self.claim, queue_names=queue_names, limit=limit, worker_id=worker_id
+            self.claim,
+            queue_names=queue_names,
+            limit=limit,
+            worker_id=worker_id,
+            limits=limits,
         )
 
     @abc.abstractmethod

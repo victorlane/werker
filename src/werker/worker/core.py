@@ -61,6 +61,7 @@ DEFAULT_REAPER_POLL_INTERVAL = 30
 DEFAULT_SCHEDULER_POLL_INTERVAL = 30
 DEFAULT_SHUTDOWN_GRACE_PERIOD = 30
 DEFAULT_CLEANUP_INTERVAL = 3600
+MIN_RATE_LIMIT_WAIT = 0.01
 #: Safety-net poll interval while LISTEN/NOTIFY is connected.
 LISTENING_POLL_INTERVAL = 5.0
 
@@ -250,7 +251,10 @@ class Worker:
             limit = min(capacity, self.claim_batch_size)
             try:
                 claimed = await self.backend.broker.aclaim(
-                    queue_names=self.queues, limit=limit, worker_id=self.worker_id
+                    queue_names=self.queues,
+                    limit=limit,
+                    worker_id=self.worker_id,
+                    limits=registry.limited_policies(),
                 )
             except Exception:
                 # A transient DB error (e.g. Postgres restart) must not kill
@@ -260,9 +264,13 @@ class Worker:
                 continue
 
             if not claimed:
-                if self.once:
+                if self.once and claimed.wait_hint is None:
                     break
-                await self._wait_for_work(self.idle_poll_interval)
+                wait = self.idle_poll_interval
+                if claimed.wait_hint is not None:
+                    # Due work is waiting on a rate limit.
+                    wait = min(wait, max(claimed.wait_hint, MIN_RATE_LIMIT_WAIT))
+                await self._wait_for_work(wait)
                 continue
 
             for item in claimed:

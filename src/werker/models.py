@@ -149,3 +149,15 @@ class WorkerRecord(models.Model):
 
     def __str__(self) -> str:
         return self.worker_id
+
+
+class RateLimitBucket(models.Model):
+    """One row per @rate_limit task path. Holds the token bucket for `rate`
+    and serializes claimers that check `concurrency`."""
+
+    key = models.CharField(max_length=255, primary_key=True)
+    tokens = models.FloatField()
+    updated_at = models.DateTimeField()
+
+    def __str__(self) -> str:
+        return self.key

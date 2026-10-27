@@ -117,3 +117,51 @@ def unique(
         return task
 
     return decorate(task) if task is not None else decorate
+
+
+_RATE_UNITS = {"s": 1, "m": 60, "h": 3600}
+
+
+def parse_rate(rate: str) -> tuple[float, float]:
+    """'10/m' -> (tokens per second, burst size of 10)."""
+    try:
+        count_text, unit = rate.replace(" ", "").split("/")
+        count = float(count_text)
+        seconds = _RATE_UNITS[unit]
+    except (AttributeError, ValueError, KeyError):
+        raise ImproperlyConfigured(
+            f"rate_limit(rate={rate!r}) must look like '10/s', '100/m' or '1000/h'."
+        ) from None
+    if count <= 0:
+        raise ImproperlyConfigured("rate_limit(rate=...) must allow at least one run.")
+    return count / seconds, count
+
+
+def rate_limit(
+    *, rate: str | None = None, burst: int | None = None, concurrency: int | None = None
+) -> TaskDecorator:
+    """Limits a task across all workers.
+
+    `rate` ('10/s', '100/m', '1000/h') is a token bucket: up to `burst`
+    runs at once (default: the count in `rate`), refilled evenly over the
+    period. `concurrency` caps how many run at the same time. Waiting tasks
+    stay READY and are not counted as attempts."""
+    if rate is None and concurrency is None:
+        raise ImproperlyConfigured("rate_limit() needs rate=, concurrency=, or both.")
+    changes: dict[str, Any] = {}
+    if rate is not None:
+        per_second, default_burst = parse_rate(rate)
+        if burst is not None and (isinstance(burst, bool) or burst < 1):
+            raise ImproperlyConfigured("rate_limit(burst=...) must be at least 1.")
+        changes["rate"] = per_second
+        changes["rate_capacity"] = float(burst if burst is not None else default_burst)
+    if concurrency is not None:
+        if isinstance(concurrency, bool) or not isinstance(concurrency, int) or concurrency < 1:
+            raise ImproperlyConfigured("rate_limit(concurrency=...) must be at least 1.")
+        changes["concurrency"] = concurrency
+
+    def decorate(task: Task[..., Any]) -> Task[..., Any]:
+        registry.set_policy(task.module_path, **changes)
+        return task
+
+    return decorate
