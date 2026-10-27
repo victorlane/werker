@@ -19,7 +19,7 @@ import signal
 import socket
 import traceback
 import uuid
-from collections.abc import Awaitable, Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from datetime import timedelta
 from inspect import iscoroutinefunction
 from typing import Any
@@ -37,8 +37,10 @@ from werker.backend import PostgresTaskBackend
 from werker.broker import ClaimedItem, retries_remaining
 from werker.config import validate_options
 from werker.exceptions import TaskCancelled, TaskTimeout
+from werker.maintenance import parse_result_ttl
 from werker.models import DBTaskResult, DeliveryGuarantee
 from werker.retry import backoff_delay
+from werker.worker.cleanup import cleanup_loop
 from werker.worker.executor import create_executor, run_with_connection_cleanup
 from werker.worker.listener import listen_loop
 from werker.worker.presence import presence_loop, save_presence, touch_health_file
@@ -58,6 +60,7 @@ DEFAULT_STALE_RUNNING_TIMEOUT = 300
 DEFAULT_REAPER_POLL_INTERVAL = 30
 DEFAULT_SCHEDULER_POLL_INTERVAL = 30
 DEFAULT_SHUTDOWN_GRACE_PERIOD = 30
+DEFAULT_CLEANUP_INTERVAL = 3600
 #: Safety-net poll interval while LISTEN/NOTIFY is connected.
 LISTENING_POLL_INTERVAL = 5.0
 
@@ -119,6 +122,8 @@ class Worker:
         )
         self.task_timeout: float | None = options.get("TASK_TIMEOUT")
         self.health_file: str | None = health_file or options.get("HEALTH_FILE")
+        self.result_ttl = _result_ttl(options.get("RESULT_TTL"))
+        self.cleanup_interval: float = options.get("CLEANUP_INTERVAL", DEFAULT_CLEANUP_INTERVAL)
         self.listen_notify: bool = options.get("LISTEN_NOTIFY", True)
         self.listen_database: str = options.get("LISTEN_DATABASE") or router.db_for_write(
             DBTaskResult
@@ -157,6 +162,8 @@ class Worker:
                 loops.append(presence_loop(self))
                 if self.listen_notify:
                     loops.append(listen_loop(self))
+                if self.result_ttl:
+                    loops.append(cleanup_loop(self))
             await asyncio.gather(*loops)
         finally:
             await save_presence(self, stopped=True)
@@ -528,6 +535,19 @@ class Worker:
             await self.backend.broker.aack(
                 item.id, worker_id=self.worker_id, attempt=item.attempt
             )
+
+
+def _result_ttl(raw: Any) -> dict[str, timedelta]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, Mapping):
+        raise ImproperlyConfigured(
+            'TASKS OPTIONS["RESULT_TTL"] must be a mapping like {"SUCCESSFUL": "7d"}.'
+        )
+    try:
+        return parse_result_ttl(raw)
+    except (ValueError, TypeError) as exc:
+        raise ImproperlyConfigured(f'TASKS OPTIONS["RESULT_TTL"]: {exc}') from exc
 
 
 async def _outcome(awaitable: Awaitable[Any]) -> tuple[bool, Any]:

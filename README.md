@@ -136,6 +136,8 @@ Put options under `TASKS[alias]["OPTIONS"]`. All numeric options are validated w
 | `RETRY_BACKOFF_MAX` | `300` seconds | Maximum failure retry delay. |
 | `LISTEN_NOTIFY` | `True` | Wake idle workers with Postgres `LISTEN/NOTIFY` as soon as a task is enqueued. See [Instant pickup](#instant-pickup-with-listennotify). |
 | `LISTEN_DATABASE` | the task table's database | Database alias for the `LISTEN` connection. Point it at a direct connection when the main one goes through pgbouncer in transaction mode. |
+| `RESULT_TTL` | `None` (keep everything) | Automatic cleanup: how long to keep finished tasks per status, e.g. `{"SUCCESSFUL": "7d", "FAILED": "30d"}`. See [Retention](#retention). |
+| `CLEANUP_INTERVAL` | `3600` seconds | How often a worker runs the `RESULT_TTL` cleanup. |
 | `HEALTH_FILE` | `None` | Path the worker touches on every loop pass. `taskworker --health-file` overrides it. |
 | `TASK_TIMEOUT` | `None` (no limit) | Seconds an attempt may run before it fails with `werker.exceptions.TaskTimeout`. See [Timeouts](#timeouts). |
 | `RETRY_JITTER` | `True` | Randomise each retry delay to between half and all of the computed delay, so tasks that failed together don't retry together. |
@@ -290,7 +292,17 @@ Django's task API has no "cancelled" status, so a cancelled task becomes FAILED 
 
 The task result admin has "Cancel selected tasks" and "Requeue selected failed tasks" actions.
 
-Prune old terminal results on a regular schedule. READY and RUNNING rows are never deleted by this command:
+### Retention
+
+Finished task rows are kept until you delete them. Set `RESULT_TTL` to let the workers do it:
+
+```python
+"OPTIONS": {"RESULT_TTL": {"SUCCESSFUL": "7d", "FAILED": "30d"}}
+```
+
+Every `CLEANUP_INTERVAL`, one worker (a Postgres advisory lock makes sure it's only one) deletes SUCCESSFUL and FAILED rows whose `finished_at` is older than their TTL, in batches. Leave a status out to keep those rows. READY and RUNNING rows are never deleted. The same pass forgets worker records not seen for 7 days.
+
+To prune by hand or from your own scheduler instead, use the management command. READY and RUNNING rows are never deleted by it either:
 
 ```bash
 python manage.py prune_task_results --older-than=30d      # default retention

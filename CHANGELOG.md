@@ -14,6 +14,8 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Python 3.12+ is required (Django 6 does not support 3.11).
 
 ### Fixed
+- `prune_task_results` raises `CommandError` (exit code 1) for a bad
+  `--status`, and refuses READY and RUNNING.
 - A failing heartbeat query no longer stops the task's heartbeats, which
   let the reaper reclaim a task that was still running.
 - runserver autostart crashed at startup because signal handlers can't be
@@ -34,6 +36,8 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   A finished task also wakes the claim loop.
 - `@unique` decorator: enqueueing a task whose key is already READY or
   RUNNING returns the existing result instead of adding a duplicate.
+- Automatic result cleanup with the `RESULT_TTL` and `CLEANUP_INTERVAL`
+  options; one worker at a time prunes, guarded by an advisory lock.
 - Worker presence: a `WorkerRecord` row per worker (listed in the admin),
   `taskworker --health-file`, and a `werker_health` command for liveness
   and readiness probes.
