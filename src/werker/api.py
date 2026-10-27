@@ -19,6 +19,7 @@ from django.db.models import F
 from django.tasks.exceptions import TaskResultDoesNotExist
 from django.utils import timezone
 
+from werker.broker.postgres import notify_queue
 from werker.exceptions import TaskCancelled
 from werker.models import DBTaskResult, TaskStatus
 
@@ -70,10 +71,12 @@ def requeue(result_id: str, *, reset_attempts: bool = True) -> bool:
         "attempts": 0 if reset_attempts else F("attempts"),
     }
     with transaction.atomic():
-        _locked_row(result_id)
+        row = _locked_row(result_id)
         updated = DBTaskResult.objects.filter(id=result_id, status=TaskStatus.FAILED).update(
             **updates
         )
+        if updated:
+            notify_queue(row.queue_name)
     return bool(updated)
 
 

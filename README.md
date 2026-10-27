@@ -90,6 +90,14 @@ Run at least one continuously running `taskworker` process. Multiple workers may
 
 During `python manage.py runserver`, a daemon worker starts automatically for local development. Set `WERKER_AUTOSTART = False` to disable it. This is not a production process-management strategy.
 
+### Instant pickup with LISTEN/NOTIFY
+
+Enqueueing a task that is due now sends a Postgres `NOTIFY` inside the enqueue transaction, so it is delivered only when that transaction commits. Each worker holds one extra connection that `LISTEN`s and wakes the worker straight away, instead of waiting up to `POLL_INTERVAL`.
+
+Polling stays on as a safety net, at least every 5 seconds while listening: it picks up delayed tasks (`run_after`) and anything enqueued while the listener was reconnecting. If `psycopg` is missing or the `LISTEN` connection fails, the worker logs a warning and keeps polling at `POLL_INTERVAL`.
+
+`LISTEN` doesn't work through pgbouncer in transaction mode. Add a database alias with a direct connection and set `LISTEN_DATABASE` to it, or set `LISTEN_NOTIFY` to `False`.
+
 ### Health checks
 
 Every worker keeps a row in the `WorkerRecord` table, refreshed every `HEARTBEAT_INTERVAL` and marked stopped on a graceful shutdown. The admin lists workers with an "alive" column.
@@ -126,6 +134,8 @@ Put options under `TASKS[alias]["OPTIONS"]`. All numeric options are validated w
 | `MAX_RETRIES` | `3` | Retry budget written to each newly enqueued task. See retry semantics below. `0` disables retries. |
 | `RETRY_BACKOFF_BASE` | `2.0` seconds | Exponential retry base: an attempt numbered `n` waits `base ** n`. |
 | `RETRY_BACKOFF_MAX` | `300` seconds | Maximum failure retry delay. |
+| `LISTEN_NOTIFY` | `True` | Wake idle workers with Postgres `LISTEN/NOTIFY` as soon as a task is enqueued. See [Instant pickup](#instant-pickup-with-listennotify). |
+| `LISTEN_DATABASE` | the task table's database | Database alias for the `LISTEN` connection. Point it at a direct connection when the main one goes through pgbouncer in transaction mode. |
 | `HEALTH_FILE` | `None` | Path the worker touches on every loop pass. `taskworker --health-file` overrides it. |
 | `TASK_TIMEOUT` | `None` (no limit) | Seconds an attempt may run before it fails with `werker.exceptions.TaskTimeout`. See [Timeouts](#timeouts). |
 | `RETRY_JITTER` | `True` | Randomise each retry delay to between half and all of the computed delay, so tasks that failed together don't retry together. |

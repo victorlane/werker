@@ -25,6 +25,7 @@ from inspect import iscoroutinefunction
 from typing import Any
 
 from django.core.exceptions import ImproperlyConfigured
+from django.db import router
 from django.tasks import task_backends
 from django.tasks.base import TaskContext
 from django.tasks.signals import task_finished, task_started
@@ -36,9 +37,10 @@ from werker.backend import PostgresTaskBackend
 from werker.broker import ClaimedItem, retries_remaining
 from werker.config import validate_options
 from werker.exceptions import TaskCancelled, TaskTimeout
-from werker.models import DeliveryGuarantee
+from werker.models import DBTaskResult, DeliveryGuarantee
 from werker.retry import backoff_delay
 from werker.worker.executor import create_executor, run_with_connection_cleanup
+from werker.worker.listener import listen_loop
 from werker.worker.presence import presence_loop, save_presence, touch_health_file
 from werker.worker.reaper import reaper_loop
 from werker.worker.scheduler import scheduler_loop
@@ -56,6 +58,8 @@ DEFAULT_STALE_RUNNING_TIMEOUT = 300
 DEFAULT_REAPER_POLL_INTERVAL = 30
 DEFAULT_SCHEDULER_POLL_INTERVAL = 30
 DEFAULT_SHUTDOWN_GRACE_PERIOD = 30
+#: Safety-net poll interval while LISTEN/NOTIFY is connected.
+LISTENING_POLL_INTERVAL = 5.0
 
 
 def make_worker_id() -> str:
@@ -115,6 +119,10 @@ class Worker:
         )
         self.task_timeout: float | None = options.get("TASK_TIMEOUT")
         self.health_file: str | None = health_file or options.get("HEALTH_FILE")
+        self.listen_notify: bool = options.get("LISTEN_NOTIFY", True)
+        self.listen_database: str = options.get("LISTEN_DATABASE") or router.db_for_write(
+            DBTaskResult
+        )
 
         self._executor = create_executor(self.concurrency)
         self._async_semaphore = asyncio.Semaphore(self.max_async_concurrency)
@@ -124,6 +132,12 @@ class Worker:
         self._abandoned = 0
         # Ids of running tasks whose cancelling was requested.
         self._cancel_requested: set[str] = set()
+        # Set by the listener on a NOTIFY for our queues, and when a task
+        # finishes and frees capacity; wakes the claim loop early.
+        self._wakeup = asyncio.Event()
+        self._listening = False
+        self._listener_pid: int | None = None
+        self._notifications = 0
 
     async def run(self) -> None:
         self._install_signal_handlers()
@@ -141,6 +155,8 @@ class Worker:
                 loops.append(reaper_loop(self))
                 loops.append(scheduler_loop(self))
                 loops.append(presence_loop(self))
+                if self.listen_notify:
+                    loops.append(listen_loop(self))
             await asyncio.gather(*loops)
         finally:
             await save_presence(self, stopped=True)
@@ -166,6 +182,14 @@ class Worker:
         use loop.call_soon_threadsafe(worker.request_shutdown)."""
         self._shutdown.set()
 
+    @property
+    def idle_poll_interval(self) -> float:
+        """How long to wait for work when the queue looked empty. While
+        LISTEN is connected, polling is only a safety net."""
+        if self._listening:
+            return max(self.poll_interval, LISTENING_POLL_INTERVAL)
+        return self.poll_interval
+
     def _install_signal_handlers(self) -> None:
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
@@ -177,6 +201,11 @@ class Worker:
                 # tests): only the main thread may install signal handlers.
                 pass
 
+    def _task_done(self, task_coro: "asyncio.Task[None]") -> None:
+        self._inflight.discard(task_coro)
+        # Capacity freed up; claim more without waiting for the next poll.
+        self._wakeup.set()
+
     def _available_capacity(self) -> int:
         in_use = len(self._inflight) + self._abandoned
         return (self.concurrency + self.max_async_concurrency) - in_use
@@ -186,14 +215,29 @@ class Worker:
         with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(self._shutdown.wait(), timeout=timeout)
 
+    async def _wait_for_work(self, timeout: float) -> None:
+        """Like _wait_or_shutdown, but also returns early on a wakeup."""
+        waiters = {
+            asyncio.ensure_future(self._shutdown.wait()),
+            asyncio.ensure_future(self._wakeup.wait()),
+        }
+        try:
+            await asyncio.wait(waiters, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for waiter in waiters:
+                waiter.cancel()
+
     async def _task_claim_loop(self) -> None:
         while not self._shutdown.is_set():
             # Touched on every pass, so a liveness probe on it also catches a
             # stuck event loop, not only a dead process.
             touch_health_file(self.health_file)
+            # Cleared before claiming, so a wakeup that arrives during the
+            # claim isn't lost.
+            self._wakeup.clear()
             capacity = self._available_capacity()
             if capacity <= 0:
-                await self._wait_or_shutdown(self.poll_interval)
+                await self._wait_for_work(self.poll_interval)
                 continue
 
             limit = min(capacity, self.claim_batch_size)
@@ -211,13 +255,13 @@ class Worker:
             if not claimed:
                 if self.once:
                     break
-                await self._wait_or_shutdown(self.poll_interval)
+                await self._wait_for_work(self.idle_poll_interval)
                 continue
 
             for item in claimed:
                 task_coro = asyncio.ensure_future(self._execute(item))
                 self._inflight.add(task_coro)
-                task_coro.add_done_callback(self._inflight.discard)
+                task_coro.add_done_callback(self._task_done)
 
         await self._drain_inflight()
 

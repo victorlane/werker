@@ -29,6 +29,9 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `@retry` decorator: per-task retry budget, exception filter (`on=`) and
   backoff settings.
 - `RETRY_JITTER` option (default on) that randomises retry delays.
+- LISTEN/NOTIFY wakeups: idle workers pick up a newly enqueued task at
+  once instead of at the next poll (`LISTEN_NOTIFY`, `LISTEN_DATABASE`).
+  A finished task also wakes the claim loop.
 - Worker presence: a `WorkerRecord` row per worker (listed in the admin),
   `taskworker --health-file`, and a `werker_health` command for liveness
   and readiness probes.

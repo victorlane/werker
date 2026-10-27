@@ -8,7 +8,7 @@ would own its own separate storage.
 from collections.abc import Sequence
 from datetime import datetime, timedelta
 
-from django.db import transaction
+from django.db import connections, router, transaction
 from django.db.models import F, Q
 from django.db.models.functions import Coalesce
 from django.utils import timezone
@@ -23,6 +23,16 @@ from werker.broker import (
 )
 from werker.models import DBTaskResult, DeliveryGuarantee, PeriodicTask, TaskStatus
 
+#: Postgres NOTIFY channel; the payload is the queue name.
+NOTIFY_CHANNEL = "werker"
+
+
+def notify_queue(queue_name: str) -> None:
+    """Wakes workers listening for this queue. Inside a transaction,
+    Postgres delivers the notification only when it commits."""
+    with connections[router.db_for_write(DBTaskResult)].cursor() as cursor:
+        cursor.execute("SELECT pg_notify(%s, %s)", [NOTIFY_CHANNEL, queue_name])
+
 
 class PostgresBroker(Broker):
     supports_skip_locked = True
@@ -35,6 +45,8 @@ class PostgresBroker(Broker):
             run_after=item.run_after,
             status=TaskStatus.READY,
         )
+        if item.run_after <= timezone.now():
+            notify_queue(item.queue_name)
 
     def claim(
         self, *, queue_names: Sequence[str], limit: int, worker_id: str
