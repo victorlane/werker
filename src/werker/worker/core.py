@@ -319,6 +319,19 @@ class Worker:
             )
 
     async def _run_claimed(self, item: ClaimedItem) -> None:
+        # Before loading the TaskResult: django.tasks derives its `attempts`
+        # (and so TaskContext.attempt) from the worker_ids this appends to.
+        owns_claim = await self.backend.result_store.amark_running(
+            item.id, worker_id=self.worker_id, attempt=item.attempt
+        )
+        if not owns_claim:
+            logger.info(
+                "worker %s no longer owns task %s attempt %s",
+                self.worker_id,
+                item.id,
+                item.attempt,
+            )
+            return
         try:
             result = await self.backend.aget_result(item.id)
         except Exception as exc:
@@ -331,17 +344,6 @@ class Worker:
             return
         task = result.task
 
-        owns_claim = await self.backend.result_store.amark_running(
-            item.id, worker_id=self.worker_id, attempt=item.attempt
-        )
-        if not owns_claim:
-            logger.info(
-                "worker %s no longer owns task %s attempt %s",
-                self.worker_id,
-                item.id,
-                item.attempt,
-            )
-            return
         task_started.send(sender=type(self.backend), task_result=result)
 
         call_args = (
